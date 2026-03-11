@@ -1,0 +1,20 @@
+# Training configuration — LWIR branch
+modality: lwir
+
+data: data/lwir/data.yaml
+project: runs
+
+# Architectures to train and compare (comment out to skip)
+architectures:
+  - yolo26n.pt
+  # - yolo26s.pt
+
+epochs: 3
+imgsz: 320
+batch: 8
+workers: 2
+amp: false      # MPS: keep off for stability
+cache: false
+plots: true
+device: mps
+fraction: 0.05  # smoke test only — remove for real training

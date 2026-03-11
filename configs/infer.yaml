@@ -1,0 +1,21 @@
+# Dual-stream inference configuration
+rgb_model:  runs/rgb/yolo26n_320px/weights/best.pt
+lwir_model: runs/lwir/yolo26n_320px/weights/best.pt
+
+# Synchronized video files or image directories
+rgb_source:  data/rgb_test.mp4
+lwir_source: data/lwir_test.mp4
+
+output: runs/inference/output.mp4
+
+render_mode: debug   # sbs | fused_on_rgb | debug
+max_frames: 300      # null to run until a stream ends
+
+fusion_method: wbf   # wbf | bayesian
+iou_thr:  0.55
+skip_thr: 0.01
+conf_thr: 0.05       # low threshold — smoke-test models have low confidence
+
+imgsz:  320          # match training resolution
+device: mps
+show:   true

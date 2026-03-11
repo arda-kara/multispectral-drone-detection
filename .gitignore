@@ -1,0 +1,8 @@
+260205_UV_LWIR_VIS_Olcumleri/
+__pycache__/
+.DS_Store
+yolo26n.pt
+runs/
+data/        
+data_annotations_lwir.zip        
+data_annotations_lwir/

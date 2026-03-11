@@ -1,0 +1,24 @@
+# Training configuration
+# modality: label for this training run (rgb / lwir / uv)
+modality: rgb
+
+data: data/roboflow/data.yaml
+project: runs
+
+# Architectures to train and compare (comment out to skip)
+architectures:
+  - yolo26n.pt
+  # - yolo26s.pt
+  # - yolov8n.pt
+  # - yolo11n.pt
+  # - yolov12n.pt
+
+epochs: 3
+imgsz: 320
+batch: 8
+workers: 2
+amp: false      # MPS: keep off for stability
+cache: false
+plots: true
+device: mps
+fraction: 0.05  # smoke test only — remove for real training

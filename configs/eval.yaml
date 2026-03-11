@@ -1,0 +1,16 @@
+# Evaluation configuration
+project: runs
+split: test
+imgsz: 320
+batch: 8
+workers: 2
+plots: true
+device: mps
+
+evaluations:
+  - modality: rgb
+    weights: runs/rgb/yolo26n_320px/weights/best.pt
+    data: data/roboflow/data.yaml
+  - modality: lwir
+    weights: runs/lwir/yolo26n_320px/weights/best.pt
+    data: data/lwir/data.yaml

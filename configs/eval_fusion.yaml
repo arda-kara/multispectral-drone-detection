@@ -1,0 +1,21 @@
+# Fusion evaluation configuration
+rgb_model:  runs/rgb/yolo26n_320px/weights/best.pt
+lwir_model: runs/lwir/yolo26n_320px/weights/best.pt
+
+# LWIR test set (images + YOLO labels)
+lwir_images: data/lwir/test/images
+lwir_labels: data/lwir/test/labels
+
+# Synchronized RGB video — frames are sought by timestamp:
+# rgb_idx = lwir_frame_num * (rgb_fps / lwir_fps)
+rgb_video: data/rgb_test.mp4
+lwir_fps:  30.0   # fps of the original LWIR source video
+
+iou_thr:  0.55
+skip_thr: 0.01
+
+imgsz:  320       # match training resolution
+device: mps
+project: runs
+
+max_frames: 200   # null to evaluate all 4697 test frames
