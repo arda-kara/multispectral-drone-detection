@@ -10,26 +10,53 @@ import cv2
 import numpy as np
 
 try:
-    from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
+    from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                                  QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-                                 QPushButton, QCheckBox, QComboBox, QFileDialog, QFormLayout, QLineEdit, QProgressBar)
-    from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+                                 QPushButton, QCheckBox, QComboBox, QFileDialog, QFormLayout, QLineEdit,
+                                 QScrollArea, QFrame)
+    from PyQt6.QtCore import QThread, pyqtSignal, Qt
     from PyQt6.QtGui import QImage, QPixmap, QFont
 except ImportError:
     print("PyQt6 is not installed. Please install it with: pip install PyQt6")
     sys.exit(1)
 
 import time
-import psutil
 
 from ultralytics import YOLO
 
 # Local imports
-from infer import load_config, FrameSource, draw_boxes, add_banner, to_bgr, _COLOR
-from fusion import filter_rgb, filter_lwir, fuse
+from infer import load_config, FrameSource, draw_boxes, draw_fused_boxes, add_banner, to_bgr, _COLOR
+from fusion import filter_rgb, filter_lwir, fuse, load_homography, parse_offset, warp_boxes
+
+# Maps grid combo text (lowercased) to emitted frames_dict keys
+_COMBO_KEY = {
+    "rgb": "rgb",
+    "lwir": "lwir",
+    "uv": "uv",
+    "fused": "fused",
+    "aligned lwir": "aligned_lwir",
+    "aligned uv": "aligned_uv",
+}
+
+
+def _format_offset(value) -> str:
+    try:
+        dx, dy = parse_offset(value)
+    except ValueError:
+        return "" if value is None else str(value)
+    return f"{dx:g},{dy:g}"
+
+
+def _align_label(H, offset_value) -> str:
+    if H is None:
+        return "identity"
+    dx, dy = parse_offset(offset_value)
+    if dx == 0.0 and dy == 0.0:
+        return "H-loaded"
+    return f"H+off ({dx:g},{dy:g})"
 
 class InferenceWorker(QThread):
-    frames_ready = pyqtSignal(dict, int, float)
+    frames_ready = pyqtSignal(dict, int, float, dict)
     finished_stream = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
@@ -39,9 +66,11 @@ class InferenceWorker(QThread):
         self.running = False
 
     def run(self):
+        import traceback as _tb
         self.running = True
         cfg = self.cfg
-        
+        rgb_src = lwir_src = uv_src = None  # ensure finally can always clean up
+
         try:
             # Load models
             rgb_model  = YOLO(cfg.get("rgb_model")) if cfg.get("rgb_model") else None
@@ -53,11 +82,16 @@ class InferenceWorker(QThread):
             uv_source_path = cfg.get("uv_source")
             uv_src   = FrameSource(uv_source_path) if uv_source_path else None
 
+            H_lwir = load_homography(cfg.get("lwir_homography"), cfg.get("lwir_homography_offset"))
+            H_uv   = load_homography(cfg.get("uv_homography"), cfg.get("uv_homography_offset"))
+
             do_fusion   = cfg.get("do_fusion", True)
             method      = cfg.get("fusion_method", "wbf")
             iou_thr     = float(cfg.get("iou_thr",     0.55))
             skip_thr    = float(cfg.get("skip_thr",    0.01))
             conf_thr    = float(cfg.get("conf_thr",    0.25))
+            center_dist_px = float(cfg.get("center_dist_px", 60.0))
+            fusion_margin  = float(cfg.get("fusion_margin", 0.10))
             imgsz       = int(cfg.get("imgsz",       960))
             device      = cfg.get("device",      "cpu")
             max_frames  = cfg.get("max_frames",    None)
@@ -90,24 +124,73 @@ class InferenceWorker(QThread):
                 uv_res   = uv_model(uv_frame,     **infer_kwargs)[0] if uv_model and ok_u else None
 
                 # Filter
-                boxes_r, scores_r = filter_rgb(rgb_res) if rgb_res else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
-                boxes_l, scores_l = filter_lwir(lwir_res) if lwir_res else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
-                boxes_u, scores_u = filter_lwir(uv_res) if uv_res else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
+                boxes_r, scores_r = filter_rgb(rgb_res) if rgb_res is not None else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
+                boxes_l_raw, scores_l = filter_lwir(lwir_res) if lwir_res is not None else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
+                boxes_u_raw, scores_u = filter_lwir(uv_res) if uv_res is not None else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
+                boxes_l_fused = boxes_l_raw.copy()
+                boxes_u_fused = boxes_u_raw.copy()
+
+                # Warp LWIR and UV boxes into RGB pixel space before fusion
+                if H_lwir is not None and ok_l and ok_r:
+                    boxes_l_fused = warp_boxes(
+                        boxes_l_raw,
+                        H_lwir,
+                        (lwir_frame.shape[1], lwir_frame.shape[0]),
+                        (rgb_frame.shape[1],  rgb_frame.shape[0]),
+                    )
+                if H_uv is not None and ok_u and ok_r:
+                    boxes_u_fused = warp_boxes(
+                        boxes_u_raw,
+                        H_uv,
+                        (uv_frame.shape[1], uv_frame.shape[0]),
+                        (rgb_frame.shape[1], rgb_frame.shape[0]),
+                    )
 
                 # Fuse
-                if do_fusion:
-                    fused_boxes, fused_scores = fuse(
-                        boxes_r, scores_r, boxes_l, scores_l,
-                        method=method, iou_thr=iou_thr, skip_thr=skip_thr,
-                        boxes3=boxes_u if uv_res else None,
-                        scores3=scores_u if uv_res else None,
-                    )
+                can_fuse = do_fusion and ok_r
+                if can_fuse:
+                    fusion_sources = ["rgb", "lwir"] + (["uv"] if uv_res is not None else [])
+                    fused_streams = ["rgb"] + (["lwir"] if ok_l else []) + (["uv"] if ok_u else [])
+                    if method.lower() == "spatial":
+                        fused_boxes, fused_scores, fused_details = fuse(
+                            boxes_r,
+                            scores_r,
+                            boxes_l_fused,
+                            scores_l,
+                            method=method,
+                            iou_thr=iou_thr,
+                            skip_thr=skip_thr,
+                            boxes3=boxes_u_fused if uv_res is not None else None,
+                            scores3=scores_u if uv_res is not None else None,
+                            image_wh=(rgb_frame.shape[1], rgb_frame.shape[0]),
+                            distance_thr_px=center_dist_px,
+                            source_names=fusion_sources,
+                            return_details=True,
+                        )
+                    else:
+                        fused_boxes, fused_scores = fuse(
+                            boxes_r,
+                            scores_r,
+                            boxes_l_fused,
+                            scores_l,
+                            method=method,
+                            iou_thr=iou_thr,
+                            skip_thr=skip_thr,
+                            boxes3=boxes_u_fused if uv_res is not None else None,
+                            scores3=scores_u if uv_res is not None else None,
+                        )
+                        fused_details = None
                     if len(fused_scores):
                         keep = fused_scores >= conf_thr
                         fused_boxes  = fused_boxes[keep]
                         fused_scores = fused_scores[keep]
+                        if fused_details is not None:
+                            fused_details = [detail for detail, use_box in zip(fused_details, keep.tolist()) if use_box]
+                    elif fused_details is not None:
+                        fused_details = []
                 else:
                     fused_boxes, fused_scores = np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32)
+                    fused_details = []
 
                 emitted_frames = {}
 
@@ -117,25 +200,46 @@ class InferenceWorker(QThread):
                     out_rgb = add_banner(out_rgb, f"RGB  f:{frame_idx}", color=_COLOR["rgb"])
                     emitted_frames["rgb"] = out_rgb
                     
-                    if do_fusion:
-                        out_fused = draw_boxes(to_bgr(rgb_frame.copy()), fused_boxes, fused_scores, label="fused", color=_COLOR["fused"])
-                        fused_streams = []
-                        if ok_r: fused_streams.append("rgb")
-                        if ok_l: fused_streams.append("lwir")
-                        if ok_u: fused_streams.append("uv")
+                    if can_fuse:
+                        out_fused = draw_fused_boxes(
+                            to_bgr(rgb_frame.copy()),
+                            fused_boxes,
+                            fused_scores,
+                            details=fused_details,
+                            margin_percent=fusion_margin,
+                        )
                         fusion_label = f"{'·'.join(s.upper() for s in fused_streams)}  {method.upper()}"
                         out_fused = add_banner(out_fused, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
                         emitted_frames["fused"] = out_fused
 
                 if ok_l:
-                    out_lwir = draw_boxes(to_bgr(lwir_frame), boxes_l, scores_l, label="lwir", color=_COLOR["lwir"])
+                    out_lwir = draw_boxes(to_bgr(lwir_frame), boxes_l_raw, scores_l, label="lwir", color=_COLOR["lwir"])
                     out_lwir = add_banner(out_lwir, f"LWIR  f:{frame_idx}", color=_COLOR["lwir"])
                     emitted_frames["lwir"] = out_lwir
 
                 if ok_u:
-                    out_uv = draw_boxes(to_bgr(uv_frame), boxes_u, scores_u, label="uv", color=_COLOR["uv"])
+                    out_uv = draw_boxes(to_bgr(uv_frame), boxes_u_raw, scores_u, label="uv", color=_COLOR["uv"])
                     out_uv = add_banner(out_uv, f"UV  f:{frame_idx}", color=_COLOR["uv"])
                     emitted_frames["uv"] = out_uv
+
+                # Aligned frames: LWIR/UV warped to RGB canvas for visual verification
+                if H_lwir is not None and ok_l and ok_r:
+                    dsize = (rgb_frame.shape[1], rgb_frame.shape[0])
+                    al = cv2.warpPerspective(to_bgr(lwir_frame), H_lwir, dsize,
+                                            flags=cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    al = draw_boxes(al, boxes_l_fused, scores_l, label="lwir-aligned", color=_COLOR["lwir"])
+                    al = add_banner(al, f"LWIR Aligned  f:{frame_idx}", color=_COLOR["lwir"])
+                    emitted_frames["aligned_lwir"] = al
+
+                if H_uv is not None and ok_u and ok_r:
+                    dsize = (rgb_frame.shape[1], rgb_frame.shape[0])
+                    au = cv2.warpPerspective(to_bgr(uv_frame), H_uv, dsize,
+                                            flags=cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    au = draw_boxes(au, boxes_u_fused, scores_u, label="uv-aligned", color=_COLOR["uv"])
+                    au = add_banner(au, f"UV Aligned  f:{frame_idx}", color=_COLOR["uv"])
+                    emitted_frames["aligned_uv"] = au
 
                 # FPS Calculation
                 if frame_idx == 0:
@@ -145,20 +249,41 @@ class InferenceWorker(QThread):
                     elapsed = time.time() - self.start_time
                     fps = frame_idx / elapsed
 
+                # Per-model detection metrics
+                def _stream_metrics(scores):
+                    if len(scores) == 0:
+                        return {"count": 0, "conf_max": None, "conf_avg": None}
+                    return {
+                        "count": len(scores),
+                        "conf_max": float(scores.max()),
+                        "conf_avg": float(scores.mean()),
+                    }
+
+                detection_metrics = {
+                    "rgb":   {**_stream_metrics(scores_r),     "align": "identity"},
+                    "lwir":  {**_stream_metrics(scores_l),     "align": _align_label(H_lwir, cfg.get("lwir_homography_offset"))},
+                    "uv":    {**_stream_metrics(scores_u),     "align": _align_label(H_uv, cfg.get("uv_homography_offset"))},
+                    "fused": {**_stream_metrics(fused_scores), "align": "n/a"},
+                }
+
                 # Emit frames to GUI
-                self.frames_ready.emit(emitted_frames, frame_idx, fps)
+                self.frames_ready.emit(emitted_frames, frame_idx, fps, detection_metrics)
                 frame_idx += 1
 
                 # Yield to let event loop catch up
                 self.msleep(10)
 
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            _tb.print_exc()  # always visible in the terminal
+            self.error_occurred.emit(f"{type(e).__name__}: {e}")
         finally:
             self.running = False
-            if rgb_src: rgb_src.release()
-            if lwir_src: lwir_src.release()
-            if uv_src: uv_src.release()
+            for _src in (rgb_src, lwir_src, uv_src):
+                if _src is not None:
+                    try:
+                        _src.release()
+                    except Exception:
+                        pass
             self.finished_stream.emit()
 
     def stop(self):
@@ -200,11 +325,81 @@ class VideoPanel(QLabel):
         self.setText(f"Waiting for Stream: {self._title}")
 
 
+class CollapsibleBox(QWidget):
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.toggle_button = QPushButton(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(True)
+        self.toggle_button.setStyleSheet("""
+            QPushButton {
+                text-align: left;
+                padding: 10px 12px;
+                background-color: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                font-weight: 800;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #30363d;
+            }
+            QPushButton:checked {
+                border-bottom-left-radius: 0px;
+                border-bottom-right-radius: 0px;
+                border-bottom: None;
+            }
+        """)
+        
+        self.toggle_button.toggled.connect(self.on_pressed)
+
+        self.content_area = QFrame()
+        self.content_area.setStyleSheet("""
+            QFrame {
+                background-color: rgba(22, 27, 34, 0.5);
+                border: 1px solid #30363d;
+                border-top: None;
+                border-bottom-left-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+        """)
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(12, 12, 12, 12)
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.toggle_button)
+        main_layout.addWidget(self.content_area)
+        
+        # Initialize arrow
+        self.update_arrow(True)
+
+    def on_pressed(self, checked):
+        self.content_area.setVisible(checked)
+        self.update_arrow(checked)
+
+    def update_arrow(self, checked):
+        title = self.toggle_button.text().replace("▼ ", "").replace("▶ ", "")
+        if checked:
+            self.toggle_button.setText(f"▼ {title}")
+        else:
+            self.toggle_button.setText(f"▶ {title}")
+
+    def addWidget(self, widget):
+        self.content_layout.addWidget(widget)
+        
+    def addLayout(self, layout):
+        self.content_layout.addLayout(layout)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.worker = None
+        self._had_error = False
         self.setWindowTitle("Multispectral Drone Detection - Live View")
         self.resize(1300, 800)
 
@@ -239,13 +434,31 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(content_layout)
 
         # Left side: Control Panel
-        control_group = QGroupBox("Configuration")
-        control_group.setFixedWidth(350)
-        control_layout = QVBoxLayout()
+        control_scroll = QScrollArea()
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setFixedWidth(370)
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        control_scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: transparent;
+            }
+        """)
+        
+        control_widget = QWidget()
+        control_scroll.setWidget(control_widget)
+        
+        control_layout = QVBoxLayout(control_widget)
         control_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        control_layout.setContentsMargins(0, 0, 10, 0)
+        control_layout.setSpacing(12)
 
-        # Form layout for file selectors
-        form_layout = QFormLayout()
+        # ====== PANEL 1: Models & Sources ======
+        panel1 = CollapsibleBox("Models & Sources")
+        p1_layout = QFormLayout()
         
         # RGB Model String
         self.rgb_model_input = QLineEdit()
@@ -254,7 +467,7 @@ class MainWindow(QMainWindow):
         rgb_hz = QHBoxLayout()
         rgb_hz.addWidget(self.rgb_model_input)
         rgb_hz.addWidget(self.rgb_btn)
-        form_layout.addRow("RGB Model:", rgb_hz)
+        p1_layout.addRow("RGB Model:", rgb_hz)
 
         # LWIR Model String
         self.lwir_model_input = QLineEdit()
@@ -263,7 +476,7 @@ class MainWindow(QMainWindow):
         lwir_hz = QHBoxLayout()
         lwir_hz.addWidget(self.lwir_model_input)
         lwir_hz.addWidget(self.lwir_btn)
-        form_layout.addRow("LWIR Model:", lwir_hz)
+        p1_layout.addRow("LWIR Model:", lwir_hz)
 
         # UV Model String
         self.uv_model_input = QLineEdit()
@@ -272,41 +485,85 @@ class MainWindow(QMainWindow):
         uv_hz = QHBoxLayout()
         uv_hz.addWidget(self.uv_model_input)
         uv_hz.addWidget(self.uv_btn)
-        form_layout.addRow("UV Model:", uv_hz)
+        p1_layout.addRow("UV Model:", uv_hz)
         
         # Sources
         self.rgb_src_input = QLineEdit()
-        form_layout.addRow("RGB Source:", self.rgb_src_input)
+        p1_layout.addRow("RGB Source:", self.rgb_src_input)
         
         self.lwir_src_input = QLineEdit()
-        form_layout.addRow("LWIR Source:", self.lwir_src_input)
+        p1_layout.addRow("LWIR Source:", self.lwir_src_input)
         
         self.uv_src_input = QLineEdit()
-        form_layout.addRow("UV Source:", self.uv_src_input)
+        p1_layout.addRow("UV Source:", self.uv_src_input)
+        
+        panel1.addLayout(p1_layout)
+        control_layout.addWidget(panel1)
+
+        # ====== PANEL 2: Homography & Fusion ======
+        panel2 = CollapsibleBox("Homography & Fusion")
+        # Collapse panel 2 by default to easily see panel 1 and 3 if desired, or keep open based on preference. Let's keep it open initially.
+        p2_layout = QFormLayout()
+
+        # LWIR Homography (.npy)
+        self.lwir_homo_input = QLineEdit()
+        self.lwir_homo_btn = QPushButton("Browse")
+        self.lwir_homo_btn.clicked.connect(
+            lambda: self.browse_file(self.lwir_homo_input, "Select LWIR Homography", "*.npy")
+        )
+        lwir_homo_hz = QHBoxLayout()
+        lwir_homo_hz.addWidget(self.lwir_homo_input)
+        lwir_homo_hz.addWidget(self.lwir_homo_btn)
+        p2_layout.addRow("LWIR Homo:", lwir_homo_hz)
+
+        # UV Homography (.npy)
+        self.uv_homo_input = QLineEdit()
+        self.uv_homo_btn = QPushButton("Browse")
+        self.uv_homo_btn.clicked.connect(
+            lambda: self.browse_file(self.uv_homo_input, "Select UV Homography", "*.npy")
+        )
+        uv_homo_hz = QHBoxLayout()
+        uv_homo_hz.addWidget(self.uv_homo_input)
+        uv_homo_hz.addWidget(self.uv_homo_btn)
+        p2_layout.addRow("UV Homo:", uv_homo_hz)
+
+        self.lwir_offset_input = QLineEdit()
+        self.lwir_offset_input.setPlaceholderText("dx,dy")
+        p2_layout.addRow("LWIR Offset:", self.lwir_offset_input)
+
+        self.uv_offset_input = QLineEdit()
+        self.uv_offset_input.setPlaceholderText("dx,dy")
+        p2_layout.addRow("UV Offset:", self.uv_offset_input)
 
         # Fusion Checkbox
         self.fusion_check = QCheckBox("Enable Fusion")
         self.fusion_check.setChecked(True)
-        form_layout.addRow("Fusion:", self.fusion_check)
+        p2_layout.addRow("Fusion:", self.fusion_check)
 
         # Fusion Algorithm Selection
         self.fusion_algo_combo = QComboBox()
-        self.fusion_algo_combo.addItems(["wbf", "bayesian"])
-        form_layout.addRow("Fusion Algo:", self.fusion_algo_combo)
+        self.fusion_algo_combo.addItems(["spatial", "wbf", "bayesian"])
+        p2_layout.addRow("Fusion Algo:", self.fusion_algo_combo)
 
-        control_layout.addLayout(form_layout)
-        control_layout.addSpacing(10)
+        self.center_dist_input = QLineEdit()
+        p2_layout.addRow("Center Dist px:", self.center_dist_input)
 
-        # Dynamic Grid Configuration
-        grid_group = QGroupBox("Grid Layout Selection")
-        grid_layout = QFormLayout()
+        self.fusion_margin_input = QLineEdit()
+        p2_layout.addRow("Box Margin %:", self.fusion_margin_input)
+        
+        panel2.addLayout(p2_layout)
+        control_layout.addWidget(panel2)
+
+        # ====== PANEL 3: Grid Layout & Cosmetics ======
+        panel3 = CollapsibleBox("Grid Layout")
+        p3_layout = QFormLayout()
         
         self.tl_combo = QComboBox()
         self.tr_combo = QComboBox()
         self.bl_combo = QComboBox()
         self.br_combo = QComboBox()
         
-        opts = ["None", "RGB", "LWIR", "UV", "Fused"]
+        opts = ["None", "RGB", "LWIR", "UV", "Fused", "Aligned LWIR", "Aligned UV"]
         for cb in [self.tl_combo, self.tr_combo, self.bl_combo, self.br_combo]:
             cb.addItems(opts)
             cb.currentTextChanged.connect(self._on_grid_combo_changed)
@@ -316,40 +573,55 @@ class MainWindow(QMainWindow):
         self.bl_combo.setCurrentText("UV")
         self.br_combo.setCurrentText("Fused")
         
-        grid_layout.addRow("Top Left:", self.tl_combo)
-        grid_layout.addRow("Top Right:", self.tr_combo)
-        grid_layout.addRow("Bottom Left:", self.bl_combo)
-        grid_layout.addRow("Bottom Right:", self.br_combo)
+        p3_layout.addRow("Top Left:", self.tl_combo)
+        p3_layout.addRow("Top Right:", self.tr_combo)
+        p3_layout.addRow("Bottom Left:", self.bl_combo)
+        p3_layout.addRow("Bottom Right:", self.br_combo)
         
-        grid_group.setLayout(grid_layout)
-        control_layout.addWidget(grid_group)
+        panel3.addLayout(p3_layout)
+        control_layout.addWidget(panel3)
+        panel3.toggle_button.setChecked(False) # Default collapse to save space, user can open it. Or actually keeping it open is fine too. Let's keep it open.
+        panel3.on_pressed(True)
 
-        # Playback Controls
-        play_layout = QHBoxLayout()
+        control_layout.addStretch()
+
+        # Playback Controls Main Container (Static at bottom)
+        playback_container = QWidget()
+        playback_layout = QVBoxLayout(playback_container)
+        playback_layout.setContentsMargins(0, 10, 10, 0)
+
+        play_btn_layout = QHBoxLayout()
         self.start_btn = QPushButton("▶ Start")
         self.start_btn.clicked.connect(self.start_sim)
+        self.start_btn.setStyleSheet("background-color: #238636; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+        
         self.stop_btn = QPushButton("■ Stop")
         self.stop_btn.clicked.connect(self.stop_sim)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet("background-color: #da3633; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+        
         self.reset_btn = QPushButton("↻ Reset")
         self.reset_btn.clicked.connect(self.reset_sim)
+        self.reset_btn.setStyleSheet("background-color: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 8px;")
         
-        play_layout.addWidget(self.start_btn)
-        play_layout.addWidget(self.stop_btn)
-        play_layout.addWidget(self.reset_btn)
+        play_btn_layout.addWidget(self.start_btn)
+        play_btn_layout.addWidget(self.stop_btn)
+        play_btn_layout.addWidget(self.reset_btn)
 
-        control_layout.addSpacing(20)
-        control_layout.addLayout(play_layout)
+        playback_layout.addLayout(play_btn_layout)
         
         # Status Label
         self.status_label = QLabel("Status: Ready")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: gray;")
-        control_layout.addSpacing(20)
-        control_layout.addWidget(self.status_label)
+        self.status_label.setStyleSheet("color: #8b949e; margin-top: 5px;")
+        playback_layout.addWidget(self.status_label)
         
-        control_group.setLayout(control_layout)
-        content_layout.addWidget(control_group)
+        # Combine scroll area and static playback block
+        left_main_layout = QVBoxLayout()
+        left_main_layout.addWidget(control_scroll, 1) # takes flexible space
+        left_main_layout.addWidget(playback_container, 0) # static size
+        
+        content_layout.addLayout(left_main_layout)
 
         # Middle: Video Panels
         self.video_layout = QGridLayout()
@@ -372,43 +644,48 @@ class MainWindow(QMainWindow):
 
         content_layout.addLayout(self.video_layout, 1)
 
-        # Right side: Metrics area
-        metrics_group = QGroupBox("System Telemetry")
+        # Right side: Detection Metrics
+        metrics_group = QGroupBox("Detection Metrics")
         metrics_group.setFixedWidth(250)
         metrics_layout = QVBoxLayout()
-        
-        # CPU
-        self.cpu_label = QLabel("CPU Usage: 0%")
-        self.cpu_bar = QProgressBar()
-        self.cpu_bar.setRange(0, 100)
-        self.cpu_bar.setTextVisible(False)
-        metrics_layout.addWidget(self.cpu_label)
-        metrics_layout.addWidget(self.cpu_bar)
-        
-        # RAM
-        self.ram_label = QLabel("Memory Usage: 0%")
-        self.ram_bar = QProgressBar()
-        self.ram_bar.setRange(0, 100)
-        self.ram_bar.setTextVisible(False)
-        metrics_layout.addWidget(self.ram_label)
-        metrics_layout.addWidget(self.ram_bar)
-        
-        metrics_layout.addSpacing(20)
-        
-        # FPS
+        metrics_layout.setSpacing(4)
+
+        # FPS at the top
         self.fps_label = QLabel("FPS: --")
         self.fps_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #4daafc;")
         metrics_layout.addWidget(self.fps_label)
-        
+        metrics_layout.addSpacing(12)
+
+        # Per-stream metric widgets: (stream_key, display_name, accent_color)
+        stream_defs = [
+            ("rgb",   "RGB",   "#4daafc"),
+            ("lwir",  "LWIR",  "#f0883e"),
+            ("uv",    "UV",    "#bc8cff"),
+            ("fused", "FUSED", "#3fb950"),
+        ]
+        self._stream_metric_labels = {}
+        for key, name, color in stream_defs:
+            title = QLabel(name)
+            title.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {color}; margin-top: 6px;")
+            metrics_layout.addWidget(title)
+
+            det_lbl  = QLabel("  Detections: --")
+            max_lbl  = QLabel("  Max Conf:   --")
+            avg_lbl  = QLabel("  Avg Conf:   --")
+            for lbl in (det_lbl, max_lbl, avg_lbl):
+                lbl.setStyleSheet("font-size: 12px; color: #8b949e;")
+                metrics_layout.addWidget(lbl)
+
+            homo_lbl = QLabel("  Align: identity")
+            homo_lbl.setStyleSheet("font-size: 11px; color: #484f58;")
+            metrics_layout.addWidget(homo_lbl)
+
+            self._stream_metric_labels[key] = (det_lbl, max_lbl, avg_lbl, homo_lbl)
+
         metrics_layout.addStretch()
         metrics_group.setLayout(metrics_layout)
 
         content_layout.addWidget(metrics_group)
-
-        # Setup Timer for System Metrics
-        self.metrics_timer = QTimer(self)
-        self.metrics_timer.timeout.connect(self.update_system_metrics)
-        self.metrics_timer.start(1000)
 
     def _on_grid_combo_changed(self):
         # Update dummy titles when not playing and toggle visibility
@@ -437,14 +714,6 @@ class MainWindow(QMainWindow):
             self.video_layout.setColumnStretch(0, 1 if col0_visible else 0)
             self.video_layout.setColumnStretch(1, 1 if col1_visible else 0)
 
-    def update_system_metrics(self):
-        cpu = psutil.cpu_percent()
-        ram = psutil.virtual_memory().percent
-        self.cpu_label.setText(f"CPU Usage: {cpu}%")
-        self.cpu_bar.setValue(int(cpu))
-        self.ram_label.setText(f"Memory Usage: {ram}%")
-        self.ram_bar.setValue(int(ram))
-
     def populate_config(self):
         # Set values from CLI/Config
         self.rgb_model_input.setText(self.cfg.get("rgb_model", ""))
@@ -454,7 +723,14 @@ class MainWindow(QMainWindow):
         self.rgb_src_input.setText(self.cfg.get("rgb_source", ""))
         self.lwir_src_input.setText(self.cfg.get("lwir_source", ""))
         self.uv_src_input.setText(self.cfg.get("uv_source", ""))
-        
+        self.lwir_homo_input.setText(self.cfg.get("lwir_homography") or "")
+        self.uv_homo_input.setText(self.cfg.get("uv_homography") or "")
+        self.lwir_offset_input.setText(_format_offset(self.cfg.get("lwir_homography_offset")))
+        self.uv_offset_input.setText(_format_offset(self.cfg.get("uv_homography_offset")))
+        self.center_dist_input.setText(str(self.cfg.get("center_dist_px", 60.0)))
+        self.fusion_margin_input.setText(str(self.cfg.get("fusion_margin", 0.10)))
+        self.fusion_check.setChecked(bool(self.cfg.get("do_fusion", True)))
+
         algo = self.cfg.get("fusion_method", "wbf")
         index = self.fusion_algo_combo.findText(algo)
         if index >= 0:
@@ -474,19 +750,27 @@ class MainWindow(QMainWindow):
         self.cfg["uv_source"] = self.uv_src_input.text().strip()
         self.cfg["do_fusion"] = self.fusion_check.isChecked()
         self.cfg["fusion_method"] = self.fusion_algo_combo.currentText()
+        self.cfg["lwir_homography"] = self.lwir_homo_input.text().strip() or None
+        self.cfg["uv_homography"]   = self.uv_homo_input.text().strip() or None
+        self.cfg["lwir_homography_offset"] = self.lwir_offset_input.text().strip() or "0,0"
+        self.cfg["uv_homography_offset"]   = self.uv_offset_input.text().strip() or "0,0"
+        self.cfg["center_dist_px"] = self.center_dist_input.text().strip() or "60.0"
+        self.cfg["fusion_margin"]  = self.fusion_margin_input.text().strip() or "0.10"
 
     def start_sim(self):
         if self.worker is not None and self.worker.isRunning():
             return
-        
+
+        self._had_error = False
+        self.status_label.setStyleSheet("color: gray;")
         self._sync_ui_to_cfg()
-        
+
         self.status_label.setText("Status: Loading models & starting...")
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
         self.worker = InferenceWorker(self.cfg)
-        self.worker.frames_ready.connect(self.update_frames)
+        self.worker.frames_ready.connect(self._on_frames_ready)
         self.worker.finished_stream.connect(self.on_finished)
         self.worker.error_occurred.connect(self.on_error)
         self.worker.start()
@@ -494,14 +778,15 @@ class MainWindow(QMainWindow):
     def stop_sim(self):
         if self.worker is not None:
             self.worker.stop()
-            # Do not call .wait() here as it blocks the main thread
-            # Let the thread finish naturally
-        
+
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("Status: Stopped")
+        if not self._had_error:
+            self.status_label.setText("Status: Stopped")
 
     def reset_sim(self):
+        self._had_error = False
+        self.status_label.setStyleSheet("color: gray;")
         self.stop_sim()
         self.panel_tl.clear_frame()
         self.panel_tr.clear_frame()
@@ -510,39 +795,60 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Status: Reset and ready.")
         self.fps_label.setText("FPS: --")
 
-    def update_frames(self, frames_dict, frame_idx, fps):
+    def _on_frames_ready(self, frames_dict, frame_idx, fps, detection_metrics):
         self.status_label.setText(f"Status: Running... Frame {frame_idx}")
         self.fps_label.setText(f"FPS: {fps:.1f}")
-        
+
         combos = [self.tl_combo, self.tr_combo, self.bl_combo, self.br_combo]
         panels = [self.panel_tl, self.panel_tr, self.panel_bl, self.panel_br]
-        
+
         for combo, panel in zip(combos, panels):
-            selected_stream = combo.currentText().lower()
-            if selected_stream in frames_dict:
-                # Need to respect fusion checkbox
-                if selected_stream == "fused" and not self.fusion_check.isChecked():
+            stream_key = _COMBO_KEY.get(combo.currentText().lower(), combo.currentText().lower())
+            if stream_key in frames_dict:
+                if stream_key == "fused" and not self.fusion_check.isChecked():
                     panel.clear_frame()
                 else:
-                    panel.set_frame(frames_dict[selected_stream])
+                    panel.set_frame(frames_dict[stream_key])
             else:
                 panel.clear_frame()
 
+        # Refresh per-stream detection metric labels
+        for key, (det_lbl, max_lbl, avg_lbl, homo_lbl) in self._stream_metric_labels.items():
+            m = detection_metrics.get(key, {})
+            count = m.get("count", 0)
+            conf_max = m.get("conf_max")
+            conf_avg = m.get("conf_avg")
+            align = m.get("align", "identity")
+            det_lbl.setText(f"  Detections: {count}")
+            max_lbl.setText(f"  Max Conf:   {conf_max:.2f}" if conf_max is not None else "  Max Conf:   --")
+            avg_lbl.setText(f"  Avg Conf:   {conf_avg:.2f}" if conf_avg is not None else "  Avg Conf:   --")
+            homo_lbl.setText(f"  Align: {align}")
+            homo_lbl.setStyleSheet(
+                "font-size: 11px; color: #3fb950;" if align not in {"identity", "n/a"}
+                else "font-size: 11px; color: #484f58;"
+            )
+
     def on_finished(self):
-        self.status_label.setText("Status: Stream Finished.")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        if not self._had_error:
+            self.status_label.setText("Status: Stream Finished.")
 
     def on_error(self, err_msg):
-        self.status_label.setText(f"Status: Error - {err_msg}")
+        self._had_error = True
         self.status_label.setStyleSheet("color: red;")
-        self.stop_sim()
-
-    def closeEvent(self, event):
-        print("Stopping inference...")
+        self.status_label.setText(f"Status: Error — {err_msg}")
+        # Update buttons directly; do not call stop_sim() to avoid overwriting the message
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
         if self.worker is not None:
             self.worker.stop()
-            self.worker.wait(1000) # Give it 1 second to clean up before closing entirely
+
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            print("Stopping inference...")
+            self.worker.stop()
+            self.worker.wait(1000)  # Give it 1 second to clean up before closing entirely
         event.accept()
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -576,6 +882,7 @@ if __name__ == "__main__":
     if args.max_frames: cfg["max_frames"]  = args.max_frames
 
     app = QApplication(sys.argv)
+    app.setFont(QFont("Helvetica Neue"))
     
     # Modern Dark Theme Stylesheet
     app.setStyleSheet("""
@@ -583,7 +890,7 @@ if __name__ == "__main__":
             background-color: #0d1117;
         }
         QWidget {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: "Helvetica Neue", Helvetica, Arial;
             font-size: 13px;
             color: #c9d1d9;
         }

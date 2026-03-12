@@ -3,20 +3,27 @@ rgb_model:  runs/detect/rgb/yolov8n.pt
 lwir_model: runs/detect/lwir/yolov8n_960px/weights/best.pt
 uv_model:   runs/detect/uv/yolov8n_800px/weights/best.pt
 
-rgb_source:  stream_data/rgb/00016.mts_rgb.mp4
-lwir_source: stream_data/lwir/Senaryo3_Test_edited_lwir.mp4
-uv_source:   stream_data/uv/uv_merged.mp4
+rgb_source:  stream_data/rgb_synced.mp4
+lwir_source: stream_data/lwir_synced.mp4
+uv_source:   stream_data/uv_synced.mp4
+
+lwir_homography: homography/H_lwir_to_rgb.npy
+uv_homography:   homography/H_uv_to_rgb.npy
+lwir_homography_offset: [0.0, 0.0]
+uv_homography_offset:   [0.0, 0.0]  # increase x to move UV boxes right on RGB
 
 output: runs/inference/output.mp4
 
-render_mode: solo    # solo | debug | sbs | fused_on_rgb
-max_frames: 300      # null to run until a stream ends
+render_mode: grid    # solo | debug | sbs | fused_on_rgb | grid
+max_frames: null     # null to run until a stream ends
 
-fusion_method: wbf   # wbf | bayesian  (only used in debug / sbs / fused_on_rgb modes)
-iou_thr:  0.55
+fusion_method: spatial  # spatial | wbf | bayesian
+center_dist_px: 60.0    # center-distance clustering threshold in RGB pixels
+fusion_margin: 0.10     # expand fused boxes to absorb small alignment errors
+iou_thr:  0.35          # used by wbf / bayesian only
 skip_thr: 0.01
 conf_thr:   0.25   # post-fusion gate
-model_conf: 0.25   # YOLO NMS threshold — raise to suppress overlapping boxes, lower for fusion
+model_conf: 0.25   # YOLO NMS threshold
 
 imgsz:  960
 device: mps
