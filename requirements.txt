@@ -1,0 +1,15 @@
+# Core ML / inference
+torch
+ultralytics
+
+# Data processing
+numpy
+opencv-python
+pandas
+PyYAML
+
+# GUI
+PyQt6
+
+# External tool required outside pip:
+# ffmpeg  (used by scripts/build_lwir_dataset.py)
