@@ -10,7 +10,7 @@ uv_source:   stream_data/uv_synced.mp4
 lwir_homography: homography/H_lwir_to_rgb.npy
 uv_homography:   homography/H_uv_to_rgb.npy
 lwir_homography_offset: [0.0, 0.0]
-uv_homography_offset:   [0.0, 0.0]  # increase x to move UV boxes right on RGB
+uv_homography_offset:   [20.0, 0.0]  # increase x to move UV boxes right on RGB
 
 output: runs/inference/output.mp4
 
@@ -18,6 +18,7 @@ render_mode: grid    # solo | debug | sbs | fused_on_rgb | grid
 max_frames: null     # null to run until a stream ends
 
 fusion_method: spatial  # spatial | wbf | bayesian
+fusion_streams: [rgb, lwir, uv]  # choose which available streams participate in fusion
 center_dist_px: 60.0    # center-distance clustering threshold in RGB pixels
 fusion_margin: 0.10     # expand fused boxes to absorb small alignment errors
 iou_thr:  0.35          # used by wbf / bayesian only

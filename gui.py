@@ -5,9 +5,7 @@ Displays RGB, LWIR, UV, and Fused streams in a 4-panel grid.
 
 import sys
 import argparse
-from pathlib import Path
 import cv2
-import numpy as np
 
 try:
     from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
@@ -25,8 +23,20 @@ import time
 from ultralytics import YOLO
 
 # Local imports
-from infer import load_config, FrameSource, draw_boxes, draw_fused_boxes, add_banner, to_bgr, _COLOR
-from fusion import filter_rgb, filter_lwir, fuse, load_homography, parse_offset, warp_boxes
+from infer import (
+    load_config,
+    FrameSource,
+    add_banner,
+    draw_boxes,
+    draw_fused_boxes,
+    empty_detections,
+    fuse_selected_streams,
+    parse_fusion_streams,
+    stream_title,
+    to_bgr,
+    _COLOR,
+)
+from fusion import filter_rgb, filter_lwir, load_homography, parse_offset, warp_boxes
 
 # Maps grid combo text (lowercased) to emitted frames_dict keys
 _COMBO_KEY = {
@@ -37,6 +47,7 @@ _COMBO_KEY = {
     "aligned lwir": "aligned_lwir",
     "aligned uv": "aligned_uv",
 }
+_FUSION_BANDS = ("rgb", "lwir", "uv")
 
 
 def _format_offset(value) -> str:
@@ -85,7 +96,6 @@ class InferenceWorker(QThread):
             H_lwir = load_homography(cfg.get("lwir_homography"), cfg.get("lwir_homography_offset"))
             H_uv   = load_homography(cfg.get("uv_homography"), cfg.get("uv_homography_offset"))
 
-            do_fusion   = cfg.get("do_fusion", True)
             method      = cfg.get("fusion_method", "wbf")
             iou_thr     = float(cfg.get("iou_thr",     0.55))
             skip_thr    = float(cfg.get("skip_thr",    0.01))
@@ -107,16 +117,9 @@ class InferenceWorker(QThread):
 
                 ok_r, rgb_frame  = rgb_src.read() if rgb_src else (False, None)
                 ok_l, lwir_frame = lwir_src.read() if lwir_src else (False, None)
-                
-                # If neither RGB nor LWIR is available, finish
-                if not ok_r and not ok_l:
-                    if rgb_src and lwir_src:
-                        break
-                    # if only one source is selected and finishes
-                    if not rgb_src and not ok_l: break
-                    if not lwir_src and not ok_r: break
-
-                ok_u, uv_frame = uv_src.read() if uv_src else (False, None)
+                ok_u, uv_frame   = uv_src.read() if uv_src else (False, None)
+                if not ok_r and not ok_l and not ok_u:
+                    break
 
                 # Inference
                 rgb_res  = rgb_model(rgb_frame,   **infer_kwargs)[0] if rgb_model and ok_r else None
@@ -124,73 +127,57 @@ class InferenceWorker(QThread):
                 uv_res   = uv_model(uv_frame,     **infer_kwargs)[0] if uv_model and ok_u else None
 
                 # Filter
-                boxes_r, scores_r = filter_rgb(rgb_res) if rgb_res is not None else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
-                boxes_l_raw, scores_l = filter_lwir(lwir_res) if lwir_res is not None else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
-                boxes_u_raw, scores_u = filter_lwir(uv_res) if uv_res is not None else (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
-                boxes_l_fused = boxes_l_raw.copy()
-                boxes_u_fused = boxes_u_raw.copy()
+                boxes_r, scores_r = filter_rgb(rgb_res) if rgb_res is not None else empty_detections()
+                boxes_l_raw, scores_l = filter_lwir(lwir_res) if lwir_res is not None else empty_detections()
+                boxes_u_raw, scores_u = filter_lwir(uv_res) if uv_res is not None else empty_detections()
+
+                frames_dict = {}
+                boxes_dict = {}
+                scores_dict = {}
+                if ok_r:
+                    frames_dict["rgb"] = rgb_frame
+                    boxes_dict["rgb"] = boxes_r
+                    scores_dict["rgb"] = scores_r
+                if ok_l:
+                    frames_dict["lwir"] = lwir_frame
+                    boxes_dict["lwir"] = boxes_l_raw
+                    scores_dict["lwir"] = scores_l
+                if ok_u:
+                    frames_dict["uv"] = uv_frame
+                    boxes_dict["uv"] = boxes_u_raw
+                    scores_dict["uv"] = scores_u
+
+                boxes_for_fusion = {band: boxes.copy() for band, boxes in boxes_dict.items()}
 
                 # Warp LWIR and UV boxes into RGB pixel space before fusion
                 if H_lwir is not None and ok_l and ok_r:
-                    boxes_l_fused = warp_boxes(
+                    boxes_for_fusion["lwir"] = warp_boxes(
                         boxes_l_raw,
                         H_lwir,
                         (lwir_frame.shape[1], lwir_frame.shape[0]),
                         (rgb_frame.shape[1],  rgb_frame.shape[0]),
                     )
                 if H_uv is not None and ok_u and ok_r:
-                    boxes_u_fused = warp_boxes(
+                    boxes_for_fusion["uv"] = warp_boxes(
                         boxes_u_raw,
                         H_uv,
                         (uv_frame.shape[1], uv_frame.shape[0]),
                         (rgb_frame.shape[1], rgb_frame.shape[0]),
                     )
 
-                # Fuse
-                can_fuse = do_fusion and ok_r
-                if can_fuse:
-                    fusion_sources = ["rgb", "lwir"] + (["uv"] if uv_res is not None else [])
-                    fused_streams = ["rgb"] + (["lwir"] if ok_l else []) + (["uv"] if ok_u else [])
-                    if method.lower() == "spatial":
-                        fused_boxes, fused_scores, fused_details = fuse(
-                            boxes_r,
-                            scores_r,
-                            boxes_l_fused,
-                            scores_l,
-                            method=method,
-                            iou_thr=iou_thr,
-                            skip_thr=skip_thr,
-                            boxes3=boxes_u_fused if uv_res is not None else None,
-                            scores3=scores_u if uv_res is not None else None,
-                            image_wh=(rgb_frame.shape[1], rgb_frame.shape[0]),
-                            distance_thr_px=center_dist_px,
-                            source_names=fusion_sources,
-                            return_details=True,
-                        )
-                    else:
-                        fused_boxes, fused_scores = fuse(
-                            boxes_r,
-                            scores_r,
-                            boxes_l_fused,
-                            scores_l,
-                            method=method,
-                            iou_thr=iou_thr,
-                            skip_thr=skip_thr,
-                            boxes3=boxes_u_fused if uv_res is not None else None,
-                            scores3=scores_u if uv_res is not None else None,
-                        )
-                        fused_details = None
-                    if len(fused_scores):
-                        keep = fused_scores >= conf_thr
-                        fused_boxes  = fused_boxes[keep]
-                        fused_scores = fused_scores[keep]
-                        if fused_details is not None:
-                            fused_details = [detail for detail, use_box in zip(fused_details, keep.tolist()) if use_box]
-                    elif fused_details is not None:
-                        fused_details = []
-                else:
-                    fused_boxes, fused_scores = np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32)
-                    fused_details = []
+                do_fusion = bool(cfg.get("do_fusion", True))
+                fused_boxes, fused_scores, fused_details, fused_streams, fusion_canvas_key = fuse_selected_streams(
+                    frames_dict,
+                    boxes_for_fusion,
+                    scores_dict,
+                    cfg.get("fusion_streams"),
+                    do_fusion=do_fusion,
+                    method=method,
+                    iou_thr=iou_thr,
+                    skip_thr=skip_thr,
+                    conf_thr=conf_thr,
+                    center_dist_px=center_dist_px,
+                )
 
                 emitted_frames = {}
 
@@ -199,18 +186,6 @@ class InferenceWorker(QThread):
                     out_rgb = draw_boxes(to_bgr(rgb_frame), boxes_r, scores_r, label="rgb", color=_COLOR["rgb"])
                     out_rgb = add_banner(out_rgb, f"RGB  f:{frame_idx}", color=_COLOR["rgb"])
                     emitted_frames["rgb"] = out_rgb
-                    
-                    if can_fuse:
-                        out_fused = draw_fused_boxes(
-                            to_bgr(rgb_frame.copy()),
-                            fused_boxes,
-                            fused_scores,
-                            details=fused_details,
-                            margin_percent=fusion_margin,
-                        )
-                        fusion_label = f"{'·'.join(s.upper() for s in fused_streams)}  {method.upper()}"
-                        out_fused = add_banner(out_fused, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
-                        emitted_frames["fused"] = out_fused
 
                 if ok_l:
                     out_lwir = draw_boxes(to_bgr(lwir_frame), boxes_l_raw, scores_l, label="lwir", color=_COLOR["lwir"])
@@ -222,13 +197,30 @@ class InferenceWorker(QThread):
                     out_uv = add_banner(out_uv, f"UV  f:{frame_idx}", color=_COLOR["uv"])
                     emitted_frames["uv"] = out_uv
 
+                if do_fusion and fused_streams and fusion_canvas_key in frames_dict:
+                    fused_canvas = to_bgr(frames_dict[fusion_canvas_key].copy())
+                    out_fused = draw_fused_boxes(
+                        fused_canvas,
+                        fused_boxes,
+                        fused_scores,
+                        details=fused_details,
+                        margin_percent=fusion_margin,
+                    )
+                    fusion_label = f"{'·'.join(s.upper() for s in fused_streams)}  {method.upper()}"
+                    out_fused = add_banner(
+                        out_fused,
+                        f"{fusion_label} on {stream_title(fusion_canvas_key)}  f:{frame_idx}",
+                        color=_COLOR["fused"],
+                    )
+                    emitted_frames["fused"] = out_fused
+
                 # Aligned frames: LWIR/UV warped to RGB canvas for visual verification
                 if H_lwir is not None and ok_l and ok_r:
                     dsize = (rgb_frame.shape[1], rgb_frame.shape[0])
                     al = cv2.warpPerspective(to_bgr(lwir_frame), H_lwir, dsize,
                                             flags=cv2.INTER_LINEAR,
                                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                    al = draw_boxes(al, boxes_l_fused, scores_l, label="lwir-aligned", color=_COLOR["lwir"])
+                    al = draw_boxes(al, boxes_for_fusion["lwir"], scores_l, label="lwir-aligned", color=_COLOR["lwir"])
                     al = add_banner(al, f"LWIR Aligned  f:{frame_idx}", color=_COLOR["lwir"])
                     emitted_frames["aligned_lwir"] = al
 
@@ -237,7 +229,7 @@ class InferenceWorker(QThread):
                     au = cv2.warpPerspective(to_bgr(uv_frame), H_uv, dsize,
                                             flags=cv2.INTER_LINEAR,
                                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                    au = draw_boxes(au, boxes_u_fused, scores_u, label="uv-aligned", color=_COLOR["uv"])
+                    au = draw_boxes(au, boxes_for_fusion["uv"], scores_u, label="uv-aligned", color=_COLOR["uv"])
                     au = add_banner(au, f"UV Aligned  f:{frame_idx}", color=_COLOR["uv"])
                     emitted_frames["aligned_uv"] = au
 
@@ -413,7 +405,7 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # High-Tech Header
-        header_label = QLabel("MULTISPECTRAL DRONE DETECTION INTELLIGENCE")
+        header_label = QLabel("MULTISPECTRAL DRONE DETECTION")
         header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header_label.setStyleSheet("""
             QLabel {
@@ -538,11 +530,24 @@ class MainWindow(QMainWindow):
         # Fusion Checkbox
         self.fusion_check = QCheckBox("Enable Fusion")
         self.fusion_check.setChecked(True)
+        self.fusion_check.toggled.connect(self._sync_live_fusion_settings)
         p2_layout.addRow("Fusion:", self.fusion_check)
+
+        self.fuse_rgb_check = QCheckBox("RGB")
+        self.fuse_lwir_check = QCheckBox("LWIR")
+        self.fuse_uv_check = QCheckBox("UV")
+        for checkbox in (self.fuse_rgb_check, self.fuse_lwir_check, self.fuse_uv_check):
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._sync_live_fusion_settings)
+        fuse_streams_hz = QHBoxLayout()
+        fuse_streams_hz.addWidget(self.fuse_rgb_check)
+        fuse_streams_hz.addWidget(self.fuse_lwir_check)
+        fuse_streams_hz.addWidget(self.fuse_uv_check)
+        p2_layout.addRow("Fuse Streams:", fuse_streams_hz)
 
         # Fusion Algorithm Selection
         self.fusion_algo_combo = QComboBox()
-        self.fusion_algo_combo.addItems(["spatial", "wbf", "bayesian"])
+        self.fusion_algo_combo.addItems(["spatial"])
         p2_layout.addRow("Fusion Algo:", self.fusion_algo_combo)
 
         self.center_dist_input = QLineEdit()
@@ -730,6 +735,12 @@ class MainWindow(QMainWindow):
         self.center_dist_input.setText(str(self.cfg.get("center_dist_px", 60.0)))
         self.fusion_margin_input.setText(str(self.cfg.get("fusion_margin", 0.10)))
         self.fusion_check.setChecked(bool(self.cfg.get("do_fusion", True)))
+        selected_fusion_streams = parse_fusion_streams(self.cfg.get("fusion_streams"))
+        if selected_fusion_streams is None:
+            selected_fusion_streams = list(_FUSION_BANDS)
+        self.fuse_rgb_check.setChecked("rgb" in selected_fusion_streams)
+        self.fuse_lwir_check.setChecked("lwir" in selected_fusion_streams)
+        self.fuse_uv_check.setChecked("uv" in selected_fusion_streams)
 
         algo = self.cfg.get("fusion_method", "wbf")
         index = self.fusion_algo_combo.findText(algo)
@@ -741,6 +752,20 @@ class MainWindow(QMainWindow):
         if path:
             line_edit.setText(path)
 
+    def _selected_fusion_streams_from_ui(self) -> list[str]:
+        selected = []
+        if self.fuse_rgb_check.isChecked():
+            selected.append("rgb")
+        if self.fuse_lwir_check.isChecked():
+            selected.append("lwir")
+        if self.fuse_uv_check.isChecked():
+            selected.append("uv")
+        return selected
+
+    def _sync_live_fusion_settings(self):
+        self.cfg["do_fusion"] = self.fusion_check.isChecked()
+        self.cfg["fusion_streams"] = self._selected_fusion_streams_from_ui()
+
     def _sync_ui_to_cfg(self):
         self.cfg["rgb_model"] = self.rgb_model_input.text().strip()
         self.cfg["lwir_model"] = self.lwir_model_input.text().strip()
@@ -749,6 +774,7 @@ class MainWindow(QMainWindow):
         self.cfg["lwir_source"] = self.lwir_src_input.text().strip()
         self.cfg["uv_source"] = self.uv_src_input.text().strip()
         self.cfg["do_fusion"] = self.fusion_check.isChecked()
+        self.cfg["fusion_streams"] = self._selected_fusion_streams_from_ui()
         self.cfg["fusion_method"] = self.fusion_algo_combo.currentText()
         self.cfg["lwir_homography"] = self.lwir_homo_input.text().strip() or None
         self.cfg["uv_homography"]   = self.uv_homo_input.text().strip() or None
@@ -879,7 +905,8 @@ if __name__ == "__main__":
     if args.lwir_src:   cfg["lwir_source"] = args.lwir_src
     if args.uv_src:     cfg["uv_source"]   = args.uv_src
     if args.device:     cfg["device"]      = args.device
-    if args.max_frames: cfg["max_frames"]  = args.max_frames
+    if args.max_frames is not None:
+        cfg["max_frames"] = args.max_frames
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Helvetica Neue"))

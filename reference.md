@@ -160,6 +160,7 @@ Prints progress every 100 frames.
 | `render_mode` | `grid` | See render modes below |
 | `max_frames` | `300` | Frame cap; `null` to run until a stream ends |
 | `fusion_method` | `spatial` | `spatial`, `wbf`, or `bayesian` |
+| `fusion_streams` | `[rgb, lwir, uv]` | Which available streams participate in fusion |
 | `center_dist_px` | `60.0` | Spatial fusion: cluster detections by center distance in RGB pixels |
 | `fusion_margin` | `0.10` | Expand fused boxes after clustering to absorb small alignment error |
 | `iou_thr` | `0.35` | IoU threshold for `wbf` / `bayesian` |
@@ -238,6 +239,13 @@ fusion_method: spatial
 #              from all streams and returns a weighted-average box per cluster.
 #   bayesian — Independent-sensor fusion: matched pairs get
 #              P = s1*s2 / (s1*s2 + (1-s1)*(1-s2)); unmatched boxes pass through.
+
+fusion_streams: [rgb, lwir, uv]
+# Optional subset of available streams to fuse. Examples:
+#   [rgb, lwir]  -> fuse only RGB+LWIR
+#   [lwir, uv]   -> fuse only LWIR+UV
+#   [uv]         -> pass UV detections through the fused view
+# Omit or set to null to fuse all currently available streams.
 
 iou_thr: 0.35
 # IoU threshold used by WBF and Bayesian fusion.
@@ -335,6 +343,7 @@ inference loop as `infer.py` in a background thread.
 | `-rs / --rgb-src` | RGB video source |
 | `-ls / --lwir-src` | LWIR video source |
 | `-us / --uv-src` | UV video source |
+| `--fusion-streams` | Comma-separated fusion subset, e.g. `rgb,lwir` or `lwir,uv` |
 | `-d / --device` | Compute device |
 | `-n / --max-frames` | Frame cap |
 
@@ -354,6 +363,7 @@ inference loop as `infer.py` in a background thread.
 | Control | Effect |
 |---------|--------|
 | `LWIR Offset`, `UV Offset` | Live-edit `[dx, dy]` post-homography shifts |
+| `Fuse Streams` | Toggle RGB / LWIR / UV participation in the fused output while the GUI is running |
 | `Fusion Algo` | Switch between `spatial`, `wbf`, and `bayesian` |
 | `Center Dist px` | Spatial fusion cluster distance threshold |
 | `Box Margin %` | Expansion applied to fused boxes for display |

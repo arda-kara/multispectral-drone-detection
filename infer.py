@@ -36,6 +36,8 @@ from ultralytics import YOLO
 
 from fusion import expand_boxes, filter_lwir, filter_rgb, fuse, load_homography, warp_boxes
 
+_STREAM_ORDER = ("rgb", "lwir", "uv")
+
 
 # ── config ────────────────────────────────────────────────────────────────────
 
@@ -83,6 +85,51 @@ class FrameSource:
     def release(self):
         if self._cap is not None:
             self._cap.release()
+
+
+def empty_detections() -> tuple[np.ndarray, np.ndarray]:
+    return np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+
+def parse_fusion_streams(value: object | None) -> list[str] | None:
+    """Parse a fusion-stream selector from YAML/CLI/UI input."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        raw_items = text.replace(";", ",").split(",")
+    elif isinstance(value, np.ndarray):
+        raw_items = value.tolist()
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raise ValueError(
+            "fusion_streams must be null, a comma-separated string, or a list/tuple/set of stream names"
+        )
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        band = str(item).strip().lower()
+        if not band:
+            continue
+        if band not in _STREAM_ORDER:
+            valid = ", ".join(_STREAM_ORDER)
+            raise ValueError(f"Unsupported fusion stream {band!r}. Expected one of: {valid}")
+        if band not in seen:
+            selected.append(band)
+            seen.add(band)
+    return selected
+
+
+def resolve_fusion_streams(value: object | None, available_streams: list[str]) -> list[str]:
+    requested = parse_fusion_streams(value)
+    if requested is None:
+        return [band for band in _STREAM_ORDER if band in available_streams]
+    return [band for band in requested if band in available_streams]
 
 
 # ── drawing ───────────────────────────────────────────────────────────────────
@@ -184,6 +231,28 @@ def make_blank_panel(size: tuple[int, int], text: str = "Unused") -> np.ndarray:
     return add_banner(blank, text, color=(160, 160, 160))
 
 
+def stream_title(stream_key: str) -> str:
+    return {
+        "rgb": "RGB",
+        "lwir": "LWIR",
+        "uv": "UV",
+        "aligned_lwir": "LWIR aligned",
+        "aligned_uv": "UV aligned",
+    }.get(stream_key, stream_key.replace("_", " ").upper())
+
+
+def pick_stream_key(
+    frames: dict[str, np.ndarray],
+    preferred: tuple[str, ...] | list[str] | None = None,
+) -> str | None:
+    if preferred is None:
+        preferred = _STREAM_ORDER
+    for key in preferred:
+        if key in frames:
+            return key
+    return next(iter(frames), None)
+
+
 # ── rendering ─────────────────────────────────────────────────────────────────
 
 # Per-band colours
@@ -207,61 +276,106 @@ def render_frame(
     fusion_method: str,
     fused_streams: list[str] | None = None,
     fusion_margin: float = 0.0,
+    fusion_canvas_key: str | None = None,
 ) -> np.ndarray:
-    fusion_label = f"{'·'.join(s.upper() for s in (fused_streams or ['RGB', 'LWIR']))}  {fusion_method.upper()}"
-    h_ref = to_bgr(frames["rgb"]).shape[0]
+    if fused_streams:
+        fusion_label = f"{'·'.join(s.upper() for s in fused_streams)}  {fusion_method.upper()}"
+    else:
+        fusion_label = f"FUSED  {fusion_method.upper()}"
+    base_key = fusion_canvas_key if fusion_canvas_key in frames else pick_stream_key(frames)
+    if base_key is None:
+        return make_blank_panel((640, 480), text="No frames")
+
+    base_frame = to_bgr(frames[base_key])
+    h_ref = base_frame.shape[0]
 
     if mode == "fused_on_rgb":
         out = draw_fused_boxes(
-            to_bgr(frames["rgb"]),
+            base_frame,
             fused_boxes,
             fused_scores,
             details=fused_details,
             margin_percent=fusion_margin,
         )
-        return add_banner(out, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
+        return add_banner(
+            out,
+            f"{fusion_label} on {stream_title(base_key)}  f:{frame_idx}",
+            color=_COLOR["fused"],
+        )
 
     if mode == "sbs":
-        aligned_lwir = to_bgr(frames.get("aligned_lwir", frames["lwir"]))
         p_rgb = draw_fused_boxes(
-            to_bgr(frames["rgb"]),
+            base_frame,
             fused_boxes,
             fused_scores,
             details=fused_details,
             margin_percent=fusion_margin,
         )
-        p_lwir = draw_fused_boxes(
-            aligned_lwir,
+        p_rgb = add_banner(
+            p_rgb,
+            f"{fusion_label} on {stream_title(base_key)}  f:{frame_idx}",
+            color=_COLOR["fused"],
+        )
+
+        compare_key = None
+        for candidate in ("aligned_lwir", "lwir", "aligned_uv", "uv"):
+            if candidate in frames and candidate != base_key:
+                compare_key = candidate
+                break
+
+        if compare_key is None:
+            return p_rgb
+
+        compare_color = _COLOR["uv"] if "uv" in compare_key else _COLOR["lwir"]
+        p_other = draw_fused_boxes(
+            to_bgr(frames[compare_key]),
             fused_boxes,
             fused_scores,
             details=fused_details,
             margin_percent=fusion_margin,
         )
-        p_rgb  = add_banner(p_rgb, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
-        p_lwir = add_banner(p_lwir, "LWIR aligned", color=_COLOR["lwir"])
-        return np.hstack([p_rgb, resize_to_height(p_lwir, h_ref)])
+        p_other = add_banner(p_other, stream_title(compare_key), color=compare_color)
+        return np.hstack([p_rgb, resize_to_height(p_other, h_ref)])
 
     if mode == "debug":
-        p_rgb  = draw_boxes(to_bgr(frames["rgb"]),  boxes["rgb"],  scores["rgb"],
-                            label="rgb",  color=_COLOR["rgb"])
-        p_lwir = draw_boxes(to_bgr(frames["lwir"]), boxes["lwir"], scores["lwir"],
-                            label="lwir", color=_COLOR["lwir"])
+        panels = []
+        for band in _STREAM_ORDER:
+            if band not in frames:
+                continue
+            panel = draw_boxes(
+                to_bgr(frames[band]),
+                boxes[band],
+                scores[band],
+                label=band,
+                color=_COLOR[band],
+            )
+            panel = add_banner(panel, f"{stream_title(band)} individual", color=_COLOR[band])
+            panels.append(resize_to_height(panel, h_ref))
+            if len(panels) == 2:
+                break
+
         p_fuse = draw_fused_boxes(
-            to_bgr(frames["rgb"]),
+            base_frame,
             fused_boxes,
             fused_scores,
             details=fused_details,
             margin_percent=fusion_margin,
         )
-        p_rgb  = add_banner(p_rgb,  "RGB individual",  color=_COLOR["rgb"])
-        p_lwir = add_banner(p_lwir, "LWIR individual", color=_COLOR["lwir"])
-        p_fuse = add_banner(p_fuse, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
-        return np.hstack([p_rgb, resize_to_height(p_lwir, h_ref), p_fuse])
+        p_fuse = add_banner(
+            p_fuse,
+            f"{fusion_label} on {stream_title(base_key)}  f:{frame_idx}",
+            color=_COLOR["fused"],
+        )
+        panels.append(p_fuse)
+        return np.hstack(panels)
 
     if mode == "grid":
-        panel_size = (frames["rgb"].shape[1] // 2, frames["rgb"].shape[0] // 2)
+        panel_size = (base_frame.shape[1] // 2, base_frame.shape[0] // 2)
         tiles = [
-            add_banner(
+            make_blank_panel(panel_size, text="RGB unavailable")
+        ]
+        if "rgb" in frames:
+            tiles[0] = add_banner(
                 cv2.resize(
                     draw_boxes(to_bgr(frames["rgb"]), boxes["rgb"], scores["rgb"], label="rgb", color=_COLOR["rgb"]),
                     panel_size,
@@ -269,7 +383,6 @@ def render_frame(
                 f"RGB  f:{frame_idx}",
                 color=_COLOR["rgb"],
             )
-        ]
 
         if "uv" in frames:
             tiles.append(
@@ -285,21 +398,24 @@ def render_frame(
         else:
             tiles.append(make_blank_panel(panel_size, text="UV unavailable"))
 
-        tiles.append(
-            add_banner(
-                cv2.resize(
-                    draw_boxes(to_bgr(frames["lwir"]), boxes["lwir"], scores["lwir"], label="lwir", color=_COLOR["lwir"]),
-                    panel_size,
-                ),
-                f"LWIR  f:{frame_idx}",
-                color=_COLOR["lwir"],
+        if "lwir" in frames:
+            tiles.append(
+                add_banner(
+                    cv2.resize(
+                        draw_boxes(to_bgr(frames["lwir"]), boxes["lwir"], scores["lwir"], label="lwir", color=_COLOR["lwir"]),
+                        panel_size,
+                    ),
+                    f"LWIR  f:{frame_idx}",
+                    color=_COLOR["lwir"],
+                )
             )
-        )
+        else:
+            tiles.append(make_blank_panel(panel_size, text="LWIR unavailable"))
         tiles.append(
             add_banner(
                 cv2.resize(
                     draw_fused_boxes(
-                        to_bgr(frames["rgb"]),
+                        base_frame,
                         fused_boxes,
                         fused_scores,
                         details=fused_details,
@@ -307,7 +423,7 @@ def render_frame(
                     ),
                     panel_size,
                 ),
-                f"FUSED ({len(fused_boxes)})  f:{frame_idx}",
+                f"FUSED on {stream_title(base_key)} ({len(fused_boxes)})  f:{frame_idx}",
                 color=_COLOR["fused"],
             )
         )
@@ -320,7 +436,7 @@ def render_frame(
 
     # solo: one panel per active stream, own detections only
     panels = []
-    for band in ("rgb", "lwir", "uv"):
+    for band in _STREAM_ORDER:
         if band not in frames:
             continue
         p = draw_boxes(to_bgr(frames[band]), boxes[band], scores[band],
@@ -330,21 +446,102 @@ def render_frame(
     return np.hstack(panels)
 
 
+def fuse_selected_streams(
+    frames: dict[str, np.ndarray],
+    boxes_for_fusion: dict[str, np.ndarray],
+    scores: dict[str, np.ndarray],
+    requested_streams: object | None,
+    *,
+    do_fusion: bool,
+    method: str,
+    iou_thr: float,
+    skip_thr: float,
+    conf_thr: float,
+    center_dist_px: float,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, object]] | None, list[str], str | None]:
+    available_streams = [band for band in _STREAM_ORDER if band in frames]
+    selected_streams = resolve_fusion_streams(requested_streams, available_streams)
+    fusion_canvas_key = "rgb" if "rgb" in frames else pick_stream_key(frames, available_streams)
+    fused_boxes, fused_scores = empty_detections()
+
+    if not do_fusion or not selected_streams:
+        return fused_boxes, fused_scores, [], selected_streams, fusion_canvas_key
+
+    if len(selected_streams) == 1:
+        band = selected_streams[0]
+        fused_boxes = boxes_for_fusion[band].copy()
+        fused_scores = scores[band].copy()
+        fused_details: list[dict[str, object]] | None = [
+            {"sensor_count": 1, "sensor_total": 1, "sources": [band]}
+            for _ in range(len(fused_boxes))
+        ]
+    else:
+        stream_boxes = [boxes_for_fusion[band] for band in selected_streams]
+        stream_scores = [scores[band] for band in selected_streams]
+        fuse_kwargs: dict[str, object] = {
+            "method": method,
+            "iou_thr": iou_thr,
+            "skip_thr": skip_thr,
+        }
+        if len(selected_streams) == 3:
+            fuse_kwargs["boxes3"] = stream_boxes[2]
+            fuse_kwargs["scores3"] = stream_scores[2]
+
+        if method.lower() == "spatial":
+            if fusion_canvas_key is None:
+                return fused_boxes, fused_scores, [], selected_streams, fusion_canvas_key
+            canvas = frames[fusion_canvas_key]
+            fused_boxes, fused_scores, fused_details = fuse(
+                stream_boxes[0],
+                stream_scores[0],
+                stream_boxes[1],
+                stream_scores[1],
+                image_wh=(canvas.shape[1], canvas.shape[0]),
+                distance_thr_px=center_dist_px,
+                source_names=selected_streams,
+                return_details=True,
+                **fuse_kwargs,
+            )
+        else:
+            fused_boxes, fused_scores = fuse(
+                stream_boxes[0],
+                stream_scores[0],
+                stream_boxes[1],
+                stream_scores[1],
+                **fuse_kwargs,
+            )
+            fused_details = None
+
+    if len(fused_scores):
+        keep = fused_scores >= conf_thr
+        fused_boxes = fused_boxes[keep]
+        fused_scores = fused_scores[keep]
+        if fused_details is not None:
+            fused_details = [detail for detail, keep_box in zip(fused_details, keep.tolist()) if keep_box]
+    elif fused_details is not None:
+        fused_details = []
+
+    return fused_boxes, fused_scores, fused_details, selected_streams, fusion_canvas_key
+
+
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
-    # Load models — UV is optional
-    rgb_model  = YOLO(cfg["rgb_model"])
-    lwir_model = YOLO(cfg["lwir_model"])
-    uv_model   = YOLO(cfg["uv_model"]) if cfg.get("uv_model") else None
+    rgb_model  = YOLO(cfg.get("rgb_model")) if cfg.get("rgb_model") else None
+    lwir_model = YOLO(cfg.get("lwir_model")) if cfg.get("lwir_model") else None
+    uv_model   = YOLO(cfg.get("uv_model")) if cfg.get("uv_model") else None
 
-    rgb_src  = FrameSource(cfg["rgb_source"])
-    lwir_src = FrameSource(cfg["lwir_source"])
+    rgb_src  = FrameSource(cfg["rgb_source"]) if cfg.get("rgb_source") else None
+    lwir_src = FrameSource(cfg["lwir_source"]) if cfg.get("lwir_source") else None
     uv_src   = FrameSource(cfg["uv_source"]) if cfg.get("uv_source") else None
+    active_sources = [src for src in (rgb_src, lwir_src, uv_src) if src is not None]
+    if not active_sources:
+        raise ValueError("At least one video source must be configured for inference.")
 
     H_lwir = load_homography(cfg.get("lwir_homography"), cfg.get("lwir_homography_offset"))
     H_uv   = load_homography(cfg.get("uv_homography"), cfg.get("uv_homography_offset"))
 
+    do_fusion   = bool(cfg.get("do_fusion", True))
     method      = cfg.get("fusion_method", "wbf")
     iou_thr     = cfg.get("iou_thr",     0.55)
     skip_thr    = cfg.get("skip_thr",    0.01)
@@ -357,6 +554,7 @@ def run(cfg: dict):
     render_mode   = cfg.get("render_mode",   "solo")
     max_frames    = cfg.get("max_frames",    None)
     display_scale = cfg.get("display_scale", 0.4)
+    output_fps    = active_sources[0].fps
 
     out_path = Path(cfg.get("output", "runs/inference/output.mp4"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,106 +575,77 @@ def run(cfg: dict):
         if max_frames is not None and frame_idx >= max_frames:
             break
 
-        ok_r, rgb_frame  = rgb_src.read()
-        ok_l, lwir_frame = lwir_src.read()
-        if not ok_r or not ok_l:
+        ok_r, rgb_frame  = rgb_src.read() if rgb_src else (False, None)
+        ok_l, lwir_frame = lwir_src.read() if lwir_src else (False, None)
+        ok_u, uv_frame   = uv_src.read() if uv_src else (False, None)
+        if not ok_r and not ok_l and not ok_u:
             break
 
-        uv_frame = None
-        if uv_src is not None:
-            ok_u, uv_frame = uv_src.read()
-            if not ok_u:
-                break
-
         # Inference
-        rgb_res  = rgb_model(rgb_frame,   **infer_kwargs)[0]
-        lwir_res = lwir_model(lwir_frame, **infer_kwargs)[0]
-        uv_res   = uv_model(uv_frame,     **infer_kwargs)[0] if uv_model and uv_frame is not None else None
+        rgb_res  = rgb_model(rgb_frame,   **infer_kwargs)[0] if rgb_model and ok_r else None
+        lwir_res = lwir_model(lwir_frame, **infer_kwargs)[0] if lwir_model and ok_l else None
+        uv_res   = uv_model(uv_frame,     **infer_kwargs)[0] if uv_model and ok_u else None
 
         # Individual detections
-        boxes_r, scores_r = filter_rgb(rgb_res)
-        boxes_l_raw, scores_l = filter_lwir(lwir_res)
-        boxes_u_raw, scores_u = filter_lwir(uv_res) if uv_res is not None else (
-            np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32)
-        )
+        boxes_r, scores_r = filter_rgb(rgb_res) if rgb_res is not None else empty_detections()
+        boxes_l_raw, scores_l = filter_lwir(lwir_res) if lwir_res is not None else empty_detections()
+        boxes_u_raw, scores_u = filter_lwir(uv_res) if uv_res is not None else empty_detections()
 
-        boxes_l_fused = boxes_l_raw.copy()
-        boxes_u_fused = boxes_u_raw.copy()
+        frames_dict: dict[str, np.ndarray] = {}
+        boxes_dict: dict[str, np.ndarray] = {}
+        scores_dict: dict[str, np.ndarray] = {}
+        if ok_r:
+            frames_dict["rgb"] = rgb_frame
+            boxes_dict["rgb"] = boxes_r
+            scores_dict["rgb"] = scores_r
+        if ok_l:
+            frames_dict["lwir"] = lwir_frame
+            boxes_dict["lwir"] = boxes_l_raw
+            scores_dict["lwir"] = scores_l
+        if ok_u:
+            frames_dict["uv"] = uv_frame
+            boxes_dict["uv"] = boxes_u_raw
+            scores_dict["uv"] = scores_u
+
+        boxes_for_fusion = {band: boxes.copy() for band, boxes in boxes_dict.items()}
 
         # Warp LWIR and UV boxes into RGB pixel space before fusion
-        if H_lwir is not None:
-            boxes_l_fused = warp_boxes(
+        if H_lwir is not None and ok_l and ok_r:
+            boxes_for_fusion["lwir"] = warp_boxes(
                 boxes_l_raw,
                 H_lwir,
                 (lwir_frame.shape[1], lwir_frame.shape[0]),
                 (rgb_frame.shape[1],  rgb_frame.shape[0]),
             )
-        if H_uv is not None and uv_frame is not None:
-            boxes_u_fused = warp_boxes(
+        if H_uv is not None and ok_u and ok_r:
+            boxes_for_fusion["uv"] = warp_boxes(
                 boxes_u_raw,
                 H_uv,
                 (uv_frame.shape[1], uv_frame.shape[0]),
                 (rgb_frame.shape[1], rgb_frame.shape[0]),
             )
 
-        # Fused detections (RGB + LWIR + UV when UV is active)
-        fused_streams = ["rgb", "lwir"] + (["uv"] if uv_res is not None else [])
-        if method.lower() == "spatial":
-            fused_boxes, fused_scores, fused_details = fuse(
-                boxes_r,
-                scores_r,
-                boxes_l_fused,
-                scores_l,
-                method=method,
-                iou_thr=iou_thr,
-                skip_thr=skip_thr,
-                boxes3=boxes_u_fused if uv_res is not None else None,
-                scores3=scores_u if uv_res is not None else None,
-                image_wh=(rgb_frame.shape[1], rgb_frame.shape[0]),
-                distance_thr_px=center_dist_px,
-                source_names=fused_streams,
-                return_details=True,
-            )
-        else:
-            fused_boxes, fused_scores = fuse(
-                boxes_r,
-                scores_r,
-                boxes_l_fused,
-                scores_l,
-                method=method,
-                iou_thr=iou_thr,
-                skip_thr=skip_thr,
-                boxes3=boxes_u_fused if uv_res is not None else None,
-                scores3=scores_u if uv_res is not None else None,
-            )
-            fused_details = None
-
-        if len(fused_scores):
-            keep = fused_scores >= conf_thr
-            fused_boxes  = fused_boxes[keep]
-            fused_scores = fused_scores[keep]
-            if fused_details is not None:
-                fused_details = [detail for detail, use_box in zip(fused_details, keep.tolist()) if use_box]
-        elif fused_details is not None:
-            fused_details = []
-
-        # Build per-band dicts for renderer
-        frames_dict = {"rgb": rgb_frame, "lwir": lwir_frame}
-        boxes_dict  = {"rgb": boxes_r,   "lwir": boxes_l_raw}
-        scores_dict = {"rgb": scores_r,  "lwir": scores_l}
-        if uv_frame is not None:
-            frames_dict["uv"] = uv_frame
-            boxes_dict["uv"]  = boxes_u_raw
-            scores_dict["uv"] = scores_u
+        fused_boxes, fused_scores, fused_details, fused_streams, fusion_canvas_key = fuse_selected_streams(
+            frames_dict,
+            boxes_for_fusion,
+            scores_dict,
+            cfg.get("fusion_streams"),
+            do_fusion=do_fusion,
+            method=method,
+            iou_thr=iou_thr,
+            skip_thr=skip_thr,
+            conf_thr=conf_thr,
+            center_dist_px=center_dist_px,
+        )
 
         # Aligned frames: LWIR/UV warped to RGB canvas for visual verification
-        if H_lwir is not None:
+        if H_lwir is not None and ok_l and ok_r:
             dsize = (rgb_frame.shape[1], rgb_frame.shape[0])
             frames_dict["aligned_lwir"] = cv2.warpPerspective(
                 to_bgr(lwir_frame), H_lwir, dsize,
                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
             )
-        if H_uv is not None and uv_frame is not None:
+        if H_uv is not None and ok_u and ok_r:
             dsize = (rgb_frame.shape[1], rgb_frame.shape[0])
             frames_dict["aligned_uv"] = cv2.warpPerspective(
                 to_bgr(uv_frame), H_uv, dsize,
@@ -491,12 +660,13 @@ def run(cfg: dict):
             fusion_method=method,
             fused_streams=fused_streams,
             fusion_margin=fusion_margin,
+            fusion_canvas_key=fusion_canvas_key,
         )
 
         if writer is None:
             h, w = combined.shape[:2]
             writer = cv2.VideoWriter(
-                str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), rgb_src.fps, (w, h),
+                str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (w, h),
             )
 
         writer.write(combined)
@@ -511,10 +681,9 @@ def run(cfg: dict):
         if frame_idx % 100 == 0:
             print(f"  {frame_idx} frames processed", flush=True)
 
-    rgb_src.release()
-    lwir_src.release()
-    if uv_src:
-        uv_src.release()
+    for src in (rgb_src, lwir_src, uv_src):
+        if src is not None:
+            src.release()
     if writer:
         writer.release()
     if show:
@@ -543,6 +712,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("-d",  "--device",    metavar="DEV", help="mps | cpu | 0 (CUDA)")
     p.add_argument("-o",  "--output",    metavar="MP4", help="output video path")
     p.add_argument("-n",  "--max-frames", metavar="N", type=int, help="frame cap")
+    p.add_argument(
+        "--fusion-streams",
+        metavar="STREAMS",
+        help="comma-separated fusion subset, e.g. rgb,lwir or lwir,uv (default: all available)",
+    )
     return p
 
 
@@ -560,6 +734,9 @@ if __name__ == "__main__":
     if args.mode:       cfg["render_mode"] = args.mode
     if args.device:     cfg["device"]      = args.device
     if args.output:     cfg["output"]      = args.output
-    if args.max_frames: cfg["max_frames"]  = args.max_frames
+    if args.max_frames is not None:
+        cfg["max_frames"] = args.max_frames
+    if args.fusion_streams is not None:
+        cfg["fusion_streams"] = args.fusion_streams
 
     run(cfg)
