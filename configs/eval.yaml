@@ -9,8 +9,8 @@ device: mps
 
 evaluations:
   - modality: rgb
-    weights: runs/rgb/yolo26n_320px/weights/best.pt
+    weights: runs/detect/rgb/yolov8n.pt
     data: data/roboflow/data.yaml
   - modality: lwir
-    weights: runs/lwir/yolo26n_320px/weights/best.pt
+    weights: runs/detect/lwir/yolov8n_960px/weights/best.pt
     data: data/lwir/data.yaml

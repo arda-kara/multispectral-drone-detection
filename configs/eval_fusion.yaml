@@ -1,6 +1,6 @@
 # Fusion evaluation configuration
-rgb_model:  runs/rgb/yolo26n_320px/weights/best.pt
-lwir_model: runs/lwir/yolo26n_320px/weights/best.pt
+rgb_model:  runs/detect/rgb/yolov8n.pt
+lwir_model: runs/detect/lwir/yolov8n_960px/weights/best.pt
 
 # LWIR test set (images + YOLO labels)
 lwir_images: data/lwir/test/images

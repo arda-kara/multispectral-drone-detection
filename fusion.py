@@ -251,33 +251,42 @@ def fuse(
     iou_thr: float = 0.55,
     skip_thr: float = 0.01,
     weights: list[float] | None = None,
+    boxes3:  np.ndarray | None = None,
+    scores3: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Fuse bounding boxes from two drone-detection models.
+    Fuse bounding boxes from two or three drone-detection models.
 
     Parameters
     ----------
-    boxes1, boxes2   : (N, 4) normalised [x1, y1, x2, y2]
-    scores1, scores2 : (N,)   confidence in [0, 1]
-    method           : "wbf" | "bayesian"
-    iou_thr          : IoU threshold for matching / clustering
-    skip_thr         : (WBF only) discard boxes below this confidence
-    weights          : (WBF only) [w_rgb, w_lwir], default equal
+    boxes1, boxes2       : (N, 4) normalised [x1, y1, x2, y2]
+    scores1, scores2     : (N,)   confidence in [0, 1]
+    boxes3, scores3      : optional third stream (e.g. UV)
+    method               : "wbf" | "bayesian"
+    iou_thr              : IoU threshold for matching / clustering
+    skip_thr             : (WBF only) discard boxes below this confidence
+    weights              : per-model weights, default equal
 
     Returns
     -------
     fused_boxes  : (M, 4)
     fused_scores : (M,)
     """
+    has_third = boxes3 is not None and scores3 is not None and len(boxes3) >= 0
+
     method = method.lower()
     if method == "wbf":
-        return _wbf(
-            [boxes1, boxes2],
-            [scores1, scores2],
-            iou_thr=iou_thr,
-            skip_thr=skip_thr,
-            weights=weights,
-        )
+        bl = [boxes1, boxes2]
+        sl = [scores1, scores2]
+        if has_third:
+            bl.append(boxes3)
+            sl.append(scores3)
+        return _wbf(bl, sl, iou_thr=iou_thr, skip_thr=skip_thr, weights=weights)
+
     if method == "bayesian":
-        return _bayesian(boxes1, scores1, boxes2, scores2, iou_thr=iou_thr)
+        b, s = _bayesian(boxes1, scores1, boxes2, scores2, iou_thr=iou_thr)
+        if has_third:
+            b, s = _bayesian(b, s, boxes3, scores3, iou_thr=iou_thr)
+        return b, s
+
     raise ValueError(f"Unknown fusion method: {method!r}. Use 'wbf' or 'bayesian'.")

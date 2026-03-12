@@ -1,21 +1,24 @@
-# Dual-stream inference configuration
-rgb_model:  runs/rgb/yolo26n_320px/weights/best.pt
-lwir_model: runs/lwir/yolo26n_320px/weights/best.pt
+# Multi-stream inference configuration
+rgb_model:  runs/detect/rgb/yolov8n.pt
+lwir_model: runs/detect/lwir/yolov8n_960px/weights/best.pt
+uv_model:   runs/detect/uv/yolov8n_800px/weights/best.pt
 
-# Synchronized video files or image directories
-rgb_source:  data/rgb_test.mp4
-lwir_source: data/lwir_test.mp4
+rgb_source:  stream_data/rgb/00016.mts_rgb.mp4
+lwir_source: stream_data/lwir/Senaryo3_Test_edited_lwir.mp4
+uv_source:   stream_data/uv/uv_merged.mp4
 
 output: runs/inference/output.mp4
 
-render_mode: debug   # sbs | fused_on_rgb | debug
+render_mode: solo    # solo | debug | sbs | fused_on_rgb
 max_frames: 300      # null to run until a stream ends
 
-fusion_method: wbf   # wbf | bayesian
+fusion_method: wbf   # wbf | bayesian  (only used in debug / sbs / fused_on_rgb modes)
 iou_thr:  0.55
 skip_thr: 0.01
-conf_thr: 0.05       # low threshold — smoke-test models have low confidence
+conf_thr:   0.25   # post-fusion gate
+model_conf: 0.25   # YOLO NMS threshold — raise to suppress overlapping boxes, lower for fusion
 
-imgsz:  320          # match training resolution
+imgsz:  960
 device: mps
 show:   true
+display_scale: 0.4   # scales the live window only — saved video is always full resolution

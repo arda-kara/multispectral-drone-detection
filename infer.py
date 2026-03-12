@@ -1,15 +1,28 @@
 """
-Dual-stream inference with bounding-box fusion.
+Multi-stream inference with optional bounding-box fusion.
 
-Reads a pair of video files or image directories (RGB + LWIR), runs each
-frame through its trained YOLO model, fuses the detections, and writes an
-annotated output video.
+Reads up to three synchronized video streams (RGB, LWIR, UV), runs each frame
+through its trained YOLO model, and writes an annotated output video.
 
 Render modes
 ------------
+solo         : one panel per active stream, each annotated with its own detections
 sbs          : side-by-side RGB | LWIR, both panels annotated with fused boxes
 fused_on_rgb : single RGB frame annotated with fused boxes only
-debug        : three-panel — RGB-individual | LWIR-individual | RGB-fused
+debug        : RGB-individual | LWIR-individual | RGB-fused
+
+CLI (all flags override the config file)
+-----------------------------------------
+  -c / --config     path to YAML config        (default: configs/infer.yaml)
+  -r / --rgb        RGB model weights (.pt)
+  -l / --lwir       LWIR model weights (.pt)
+  -u / --uv         UV model weights (.pt)
+  -rs/ --rgb-src    RGB video source
+  -ls/ --lwir-src   LWIR video source
+  -us/ --uv-src     UV video source
+  -d / --device     compute device: mps, cpu, 0  (default: mps)
+  -o / --output     output video path
+  -n / --max-frames frame cap (default: run until a stream ends)
 """
 
 import argparse
@@ -118,69 +131,100 @@ def resize_to_height(frame: np.ndarray, height: int) -> np.ndarray:
 
 # ── rendering ─────────────────────────────────────────────────────────────────
 
+# Per-band colours
+_COLOR = {
+    "rgb":   (255, 128,   0),   # orange
+    "lwir":  (  0, 200, 255),   # cyan
+    "uv":    (180,   0, 255),   # purple
+    "fused": (  0, 255,   0),   # green
+}
+
+
 def render_frame(
-    rgb_frame: np.ndarray,
-    lwir_frame: np.ndarray,
-    boxes_r: np.ndarray,
-    scores_r: np.ndarray,
-    boxes_l: np.ndarray,
-    scores_l: np.ndarray,
-    fused_boxes: np.ndarray,
+    frames:  dict[str, np.ndarray],   # {"rgb": ..., "lwir": ..., "uv": ...}  uv optional
+    boxes:   dict[str, np.ndarray],
+    scores:  dict[str, np.ndarray],
+    fused_boxes:  np.ndarray,
     fused_scores: np.ndarray,
     mode: str,
     frame_idx: int,
     fusion_method: str,
+    fused_streams: list[str] | None = None,
 ) -> np.ndarray:
-    rgb  = to_bgr(rgb_frame)
-    lwir = to_bgr(lwir_frame)
+    fusion_label = f"{'·'.join(s.upper() for s in (fused_streams or ['RGB', 'LWIR']))}  {fusion_method.upper()}"
+    h_ref = to_bgr(frames["rgb"]).shape[0]
 
     if mode == "fused_on_rgb":
-        out = draw_boxes(rgb, fused_boxes, fused_scores, label="fused", color=(0, 255, 0))
-        return add_banner(out, f"fused:{fusion_method.upper()}  f:{frame_idx}", color=(0, 255, 0))
+        out = draw_boxes(to_bgr(frames["rgb"]), fused_boxes, fused_scores,
+                         label="fused", color=_COLOR["fused"])
+        return add_banner(out, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
 
     if mode == "sbs":
-        rgb_ann  = draw_boxes(rgb,  fused_boxes, fused_scores, label="fused", color=(0, 255, 0))
-        lwir_ann = draw_boxes(lwir, fused_boxes, fused_scores, label="fused", color=(0, 200, 255))
-        rgb_ann  = add_banner(rgb_ann, f"fused:{fusion_method.upper()}  f:{frame_idx}", color=(0, 255, 0))
-        h = rgb_ann.shape[0]
-        return np.hstack([rgb_ann, resize_to_height(lwir_ann, h)])
+        p_rgb  = draw_boxes(to_bgr(frames["rgb"]),  fused_boxes, fused_scores,
+                            label="fused", color=_COLOR["fused"])
+        p_lwir = draw_boxes(to_bgr(frames["lwir"]), fused_boxes, fused_scores,
+                            label="fused", color=_COLOR["fused"])
+        p_rgb  = add_banner(p_rgb, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
+        return np.hstack([p_rgb, resize_to_height(p_lwir, h_ref)])
 
-    # debug: RGB-individual | LWIR-individual | RGB-fused
-    panel_rgb  = draw_boxes(rgb,  boxes_r,     scores_r,     label="rgb",   color=(255, 128, 0))
-    panel_lwir = draw_boxes(lwir, boxes_l,     scores_l,     label="lwir",  color=(0, 200, 255))
-    panel_fuse = draw_boxes(rgb,  fused_boxes, fused_scores, label="fused", color=(0, 255, 0))
+    if mode == "debug":
+        p_rgb  = draw_boxes(to_bgr(frames["rgb"]),  boxes["rgb"],  scores["rgb"],
+                            label="rgb",  color=_COLOR["rgb"])
+        p_lwir = draw_boxes(to_bgr(frames["lwir"]), boxes["lwir"], scores["lwir"],
+                            label="lwir", color=_COLOR["lwir"])
+        p_fuse = draw_boxes(to_bgr(frames["rgb"]),  fused_boxes,   fused_scores,
+                            label="fused", color=_COLOR["fused"])
+        p_rgb  = add_banner(p_rgb,  "RGB individual",  color=_COLOR["rgb"])
+        p_lwir = add_banner(p_lwir, "LWIR individual", color=_COLOR["lwir"])
+        p_fuse = add_banner(p_fuse, f"{fusion_label}  f:{frame_idx}", color=_COLOR["fused"])
+        return np.hstack([p_rgb, resize_to_height(p_lwir, h_ref), p_fuse])
 
-    panel_rgb  = add_banner(panel_rgb,  "RGB individual",                        color=(255, 128, 0))
-    panel_lwir = add_banner(panel_lwir, "LWIR individual",                       color=(0, 200, 255))
-    panel_fuse = add_banner(panel_fuse, f"Fused:{fusion_method.upper()}  f:{frame_idx}", color=(0, 255, 0))
-
-    h = panel_rgb.shape[0]
-    return np.hstack([panel_rgb, resize_to_height(panel_lwir, h), panel_fuse])
+    # solo: one panel per active stream, own detections only
+    panels = []
+    for band in ("rgb", "lwir", "uv"):
+        if band not in frames:
+            continue
+        p = draw_boxes(to_bgr(frames[band]), boxes[band], scores[band],
+                       label=band, color=_COLOR[band])
+        p = add_banner(p, f"{band.upper()}  f:{frame_idx}", color=_COLOR[band])
+        panels.append(resize_to_height(p, h_ref))
+    return np.hstack(panels)
 
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
+    # Load models — UV is optional
     rgb_model  = YOLO(cfg["rgb_model"])
     lwir_model = YOLO(cfg["lwir_model"])
+    uv_model   = YOLO(cfg["uv_model"]) if cfg.get("uv_model") else None
 
     rgb_src  = FrameSource(cfg["rgb_source"])
     lwir_src = FrameSource(cfg["lwir_source"])
+    uv_src   = FrameSource(cfg["uv_source"]) if cfg.get("uv_source") else None
 
     method      = cfg.get("fusion_method", "wbf")
     iou_thr     = cfg.get("iou_thr",     0.55)
     skip_thr    = cfg.get("skip_thr",    0.01)
-    conf_thr    = cfg.get("conf_thr",    0.05)
-    imgsz       = cfg.get("imgsz",       640)
+    conf_thr    = cfg.get("conf_thr",    0.25)
+    imgsz       = cfg.get("imgsz",       960)
     device      = cfg.get("device",      "cpu")
     show        = cfg.get("show",        False)
-    render_mode = cfg.get("render_mode", "debug")
-    max_frames  = cfg.get("max_frames",  None)
+    render_mode   = cfg.get("render_mode",   "solo")
+    max_frames    = cfg.get("max_frames",    None)
+    display_scale = cfg.get("display_scale", 0.4)
 
     out_path = Path(cfg.get("output", "runs/inference/output.mp4"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    infer_kwargs = dict(imgsz=imgsz, device=device, verbose=False, conf=0.01)
+    # conf_thr drives both the model NMS and the post-fusion gate.
+    # For fusion modes (debug/sbs/fused_on_rgb) a lower value can be set in
+    # the config to let WBF collect more candidates before merging.
+    model_conf   = cfg.get("model_conf", conf_thr)
+    infer_kwargs = dict(imgsz=imgsz, device=device, verbose=False, conf=model_conf)
+
+    if show:
+        cv2.namedWindow("Inference  [q to quit]", cv2.WINDOW_NORMAL)
 
     writer    = None
     frame_idx = 0
@@ -191,38 +235,56 @@ def run(cfg: dict):
 
         ok_r, rgb_frame  = rgb_src.read()
         ok_l, lwir_frame = lwir_src.read()
-
         if not ok_r or not ok_l:
             break
 
+        uv_frame = None
+        if uv_src is not None:
+            ok_u, uv_frame = uv_src.read()
+            if not ok_u:
+                break
+
         # Inference
-        rgb_result  = rgb_model(rgb_frame,   **infer_kwargs)[0]
-        lwir_result = lwir_model(lwir_frame, **infer_kwargs)[0]
+        rgb_res  = rgb_model(rgb_frame,   **infer_kwargs)[0]
+        lwir_res = lwir_model(lwir_frame, **infer_kwargs)[0]
+        uv_res   = uv_model(uv_frame,     **infer_kwargs)[0] if uv_model and uv_frame is not None else None
 
         # Individual detections
-        boxes_r, scores_r = filter_rgb(rgb_result)
-        boxes_l, scores_l = filter_lwir(lwir_result)
+        boxes_r, scores_r = filter_rgb(rgb_res)
+        boxes_l, scores_l = filter_lwir(lwir_res)
+        boxes_u, scores_u = filter_lwir(uv_res) if uv_res is not None else (
+            np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32)
+        )
 
-        # Fused detections
+        # Fused detections (RGB + LWIR + UV when UV is active)
         fused_boxes, fused_scores = fuse(
             boxes_r, scores_r, boxes_l, scores_l,
             method=method, iou_thr=iou_thr, skip_thr=skip_thr,
+            boxes3=boxes_u if uv_model else None,
+            scores3=scores_u if uv_model else None,
         )
-
-        # Confidence gate on fused output
         if len(fused_scores):
             keep = fused_scores >= conf_thr
             fused_boxes  = fused_boxes[keep]
             fused_scores = fused_scores[keep]
 
+        # Build per-band dicts for renderer
+        frames_dict = {"rgb": rgb_frame, "lwir": lwir_frame}
+        boxes_dict  = {"rgb": boxes_r,   "lwir": boxes_l}
+        scores_dict = {"rgb": scores_r,  "lwir": scores_l}
+        if uv_frame is not None:
+            frames_dict["uv"] = uv_frame
+            boxes_dict["uv"]  = boxes_u
+            scores_dict["uv"] = scores_u
+
+        fused_streams = ["rgb", "lwir"] + (["uv"] if uv_model else [])
         combined = render_frame(
-            rgb_frame, lwir_frame,
-            boxes_r, scores_r,
-            boxes_l, scores_l,
+            frames_dict, boxes_dict, scores_dict,
             fused_boxes, fused_scores,
             mode=render_mode,
             frame_idx=frame_idx,
             fusion_method=method,
+            fused_streams=fused_streams,
         )
 
         if writer is None:
@@ -234,7 +296,8 @@ def run(cfg: dict):
         writer.write(combined)
 
         if show:
-            cv2.imshow("Inference  [q to quit]", combined)
+            preview = cv2.resize(combined, None, fx=display_scale, fy=display_scale)
+            cv2.imshow("Inference  [q to quit]", preview)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
@@ -244,6 +307,8 @@ def run(cfg: dict):
 
     rgb_src.release()
     lwir_src.release()
+    if uv_src:
+        uv_src.release()
     if writer:
         writer.release()
     if show:
@@ -252,8 +317,43 @@ def run(cfg: dict):
     print(f"\nDone — {frame_idx} frames → {out_path}")
 
 
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Multi-stream inference (RGB / LWIR / UV) with optional fusion.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("-c",  "--config",    default="configs/infer.yaml", help="YAML config file")
+    p.add_argument("-r",  "--rgb",       metavar="PT",  help="RGB model weights")
+    p.add_argument("-l",  "--lwir",      metavar="PT",  help="LWIR model weights")
+    p.add_argument("-u",  "--uv",        metavar="PT",  help="UV model weights")
+    p.add_argument("-rs", "--rgb-src",   metavar="SRC", help="RGB video source")
+    p.add_argument("-ls", "--lwir-src",  metavar="SRC", help="LWIR video source")
+    p.add_argument("-us", "--uv-src",    metavar="SRC", help="UV video source")
+    p.add_argument("-m",  "--mode",      metavar="MODE",
+                   choices=["solo", "debug", "sbs", "fused_on_rgb"],
+                   help="render mode: solo | debug | sbs | fused_on_rgb")
+    p.add_argument("-d",  "--device",    metavar="DEV", help="mps | cpu | 0 (CUDA)")
+    p.add_argument("-o",  "--output",    metavar="MP4", help="output video path")
+    p.add_argument("-n",  "--max-frames", metavar="N", type=int, help="frame cap")
+    return p
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dual-stream fused inference.")
-    parser.add_argument("--config", default="configs/infer.yaml")
-    args = parser.parse_args()
-    run(load_config(args.config))
+    args = _build_parser().parse_args()
+    cfg  = load_config(args.config)
+
+    # CLI overrides config
+    if args.rgb:        cfg["rgb_model"]   = args.rgb
+    if args.lwir:       cfg["lwir_model"]  = args.lwir
+    if args.uv:         cfg["uv_model"]    = args.uv
+    if args.rgb_src:    cfg["rgb_source"]  = args.rgb_src
+    if args.lwir_src:   cfg["lwir_source"] = args.lwir_src
+    if args.uv_src:     cfg["uv_source"]   = args.uv_src
+    if args.mode:       cfg["render_mode"] = args.mode
+    if args.device:     cfg["device"]      = args.device
+    if args.output:     cfg["output"]      = args.output
+    if args.max_frames: cfg["max_frames"]  = args.max_frames
+
+    run(cfg)
