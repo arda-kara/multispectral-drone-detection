@@ -1,21 +1,27 @@
-# Fusion evaluation configuration
-rgb_model:  runs/detect/rgb/yolov8n.pt
-lwir_model: runs/detect/lwir/yolov8n_960px/weights/best.pt
+# Fusion evaluation — 6 variants across all 3 bands
+# rgb_model and lwir_model are filled in automatically by run_evaluation.py
+# after individual eval selects the best model per modality.
+rgb_model:  ~
+lwir_model: ~
+uv_model:   runs/detect/uv/best_weights/yolo8n.pt
 
-# LWIR test set (images + YOLO labels)
-lwir_images: data/lwir/test/images
+# Synchronized test streams (same capture session, frame-aligned)
+rgb_video:   stream_data/rgb_synced.mp4
+lwir_video:  stream_data/lwir_synced.mp4
+uv_video:    stream_data/uv_synced.mp4
+
+# LWIR ground-truth labels (warped to RGB space at eval time)
 lwir_labels: data/lwir/test/labels
 
-# Synchronized RGB video — frames are sought by timestamp:
-# rgb_idx = lwir_frame_num * (rgb_fps / lwir_fps)
-rgb_video: data/rgb_test.mp4
-lwir_fps:  30.0   # fps of the original LWIR source video
+# Homographies: LWIR → RGB and UV → RGB
+lwir_homography: homography/H_lwir_to_rgb.npy
+uv_homography:   homography/H_uv_to_rgb.npy
 
 iou_thr:  0.55
 skip_thr: 0.01
+imgsz:    960
+device:   mps
+project:  results/fusion
 
-imgsz:  320       # match training resolution
-device: mps
-project: runs
-
-max_frames: 200   # null to evaluate all 4697 test frames
+# null evaluates all frames; set an integer for a quick smoke-run
+max_frames: null

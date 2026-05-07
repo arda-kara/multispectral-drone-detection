@@ -30,3 +30,16 @@ imgsz:  960
 device: mps
 show:   true
 display_scale: 0.4   # scales the live window only — saved video is always full resolution
+
+# LWIR enhancement (no retraining required)
+lwir_clahe:      true   # apply CLAHE to boost low-contrast thermal targets
+lwir_clahe_clip: 2.0    # CLAHE clip limit — higher = stronger contrast
+lwir_augment:    false  # YOLO TTA (augment=True) — slower but higher recall
+lwir_model_conf: 0.15   # separate NMS threshold for the LWIR model
+
+# LWIR Kalman tracker
+lwir_tracker:        true  # enable frame-to-frame Kalman tracking
+lwir_trk_max_age:    3     # fill gaps for up to N consecutive missed frames
+lwir_trk_min_hits:   2     # confirm a track after N consecutive detections
+lwir_trk_iou_thr:    0.25  # IoU threshold for detection-to-track association
+lwir_trk_conf_decay: 0.8   # confidence multiplier per fill-in frame

@@ -20,11 +20,10 @@ except ImportError:
 
 import time
 
-from ultralytics import YOLO
-
 # Local imports
 from infer import (
     load_config,
+    load_model,
     FrameSource,
     add_banner,
     draw_boxes,
@@ -37,6 +36,7 @@ from infer import (
     _COLOR,
 )
 from fusion import filter_rgb, filter_lwir, load_homography, parse_offset, warp_boxes
+from tracker import LWIRKalmanTracker
 
 # Maps grid combo text (lowercased) to emitted frames_dict keys
 _COMBO_KEY = {
@@ -66,6 +66,12 @@ def _align_label(H, offset_value) -> str:
         return "H-loaded"
     return f"H+off ({dx:g},{dy:g})"
 
+
+def _apply_lwir_clahe(frame: np.ndarray, clahe: cv2.CLAHE) -> np.ndarray:
+    """Apply CLAHE to enhance LWIR frame contrast before inference."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
 class InferenceWorker(QThread):
     frames_ready = pyqtSignal(dict, int, float, dict)
     finished_stream = pyqtSignal()
@@ -84,9 +90,9 @@ class InferenceWorker(QThread):
 
         try:
             # Load models
-            rgb_model  = YOLO(cfg.get("rgb_model")) if cfg.get("rgb_model") else None
-            lwir_model = YOLO(cfg.get("lwir_model")) if cfg.get("lwir_model") else None
-            uv_model   = YOLO(cfg.get("uv_model")) if cfg.get("uv_model") else None
+            rgb_model  = load_model(cfg["rgb_model"])  if cfg.get("rgb_model")  else None
+            lwir_model = load_model(cfg["lwir_model"]) if cfg.get("lwir_model") else None
+            uv_model   = load_model(cfg["uv_model"])   if cfg.get("uv_model")   else None
 
             rgb_src  = FrameSource(cfg["rgb_source"]) if cfg.get("rgb_source") else None
             lwir_src = FrameSource(cfg["lwir_source"]) if cfg.get("lwir_source") else None
@@ -109,6 +115,25 @@ class InferenceWorker(QThread):
             model_conf   = float(cfg.get("model_conf", conf_thr))
             infer_kwargs = dict(imgsz=imgsz, device=device, verbose=False, conf=model_conf)
 
+            lwir_clahe_on   = bool(cfg.get("lwir_clahe", True))
+            lwir_clahe_clip = float(cfg.get("lwir_clahe_clip", 2.0))
+            lwir_augment    = bool(cfg.get("lwir_augment", False))
+            lwir_model_conf = float(cfg.get("lwir_model_conf", model_conf))
+            clahe_obj = cv2.createCLAHE(clipLimit=lwir_clahe_clip, tileGridSize=(8, 8)) if lwir_clahe_on else None
+            infer_kwargs_lwir = dict(imgsz=imgsz, device=device, verbose=False, conf=lwir_model_conf, augment=lwir_augment)
+
+            lwir_tracker_on     = bool(cfg.get("lwir_tracker", True))
+            lwir_trk_max_age    = int(cfg.get("lwir_trk_max_age", 3))
+            lwir_trk_min_hits   = int(cfg.get("lwir_trk_min_hits", 2))
+            lwir_trk_iou_thr    = float(cfg.get("lwir_trk_iou_thr", 0.25))
+            lwir_trk_conf_decay = float(cfg.get("lwir_trk_conf_decay", 0.8))
+            lwir_tracker = LWIRKalmanTracker(
+                max_age=lwir_trk_max_age,
+                min_hits=lwir_trk_min_hits,
+                iou_thr=lwir_trk_iou_thr,
+                conf_decay=lwir_trk_conf_decay,
+            ) if lwir_tracker_on else None
+
             frame_idx = 0
             
             while self.running:
@@ -121,15 +146,24 @@ class InferenceWorker(QThread):
                 if not ok_r and not ok_l and not ok_u:
                     break
 
+                # Apply LWIR preprocessing
+                lwir_frame_infer = lwir_frame
+                if clahe_obj is not None and ok_l and lwir_frame is not None:
+                    lwir_frame_infer = _apply_lwir_clahe(lwir_frame, clahe_obj)
+
                 # Inference
-                rgb_res  = rgb_model(rgb_frame,   **infer_kwargs)[0] if rgb_model and ok_r else None
-                lwir_res = lwir_model(lwir_frame, **infer_kwargs)[0] if lwir_model and ok_l else None
-                uv_res   = uv_model(uv_frame,     **infer_kwargs)[0] if uv_model and ok_u else None
+                rgb_res  = rgb_model(rgb_frame,         **infer_kwargs)[0] if rgb_model and ok_r else None
+                lwir_res = lwir_model(lwir_frame_infer, **infer_kwargs_lwir)[0] if lwir_model and ok_l else None
+                uv_res   = uv_model(uv_frame,           **infer_kwargs)[0] if uv_model and ok_u else None
 
                 # Filter
                 boxes_r, scores_r = filter_rgb(rgb_res) if rgb_res is not None else empty_detections()
                 boxes_l_raw, scores_l = filter_lwir(lwir_res) if lwir_res is not None else empty_detections()
                 boxes_u_raw, scores_u = filter_lwir(uv_res) if uv_res is not None else empty_detections()
+
+                # Kalman tracking: fill gaps + suppress single-frame FPs
+                if lwir_tracker is not None and ok_l:
+                    boxes_l_raw, scores_l = lwir_tracker.update(boxes_l_raw, scores_l)
 
                 frames_dict = {}
                 boxes_dict = {}
@@ -188,8 +222,10 @@ class InferenceWorker(QThread):
                     emitted_frames["rgb"] = out_rgb
 
                 if ok_l:
-                    out_lwir = draw_boxes(to_bgr(lwir_frame), boxes_l_raw, scores_l, label="lwir", color=_COLOR["lwir"])
-                    out_lwir = add_banner(out_lwir, f"LWIR  f:{frame_idx}", color=_COLOR["lwir"])
+                    clahe_tag = " [CLAHE]" if lwir_clahe_on else ""
+                    trk_tag   = " [TRK]"   if lwir_tracker is not None else ""
+                    out_lwir = draw_boxes(to_bgr(lwir_frame_infer), boxes_l_raw, scores_l, label="lwir", color=_COLOR["lwir"])
+                    out_lwir = add_banner(out_lwir, f"LWIR{clahe_tag}{trk_tag}  f:{frame_idx}", color=_COLOR["lwir"])
                     emitted_frames["lwir"] = out_lwir
 
                 if ok_u:

@@ -1,16 +1,52 @@
-# Evaluation configuration
-project: runs
+# Per-modality evaluation — all trained architectures
+project: results/individual
 split: test
-imgsz: 320
 batch: 8
 workers: 2
-plots: true
+plots: false
 device: mps
 
 evaluations:
+  # RGB models (6 architectures, trained on Roboflow drone-vs-bird)
   - modality: rgb
     weights: runs/detect/rgb/yolov8n.pt
     data: data/roboflow/data.yaml
+    imgsz: 640
+  - modality: rgb
+    weights: runs/detect/rgb/yolov8s.pt
+    data: data/roboflow/data.yaml
+    imgsz: 640
+  - modality: rgb
+    weights: runs/detect/rgb/yolov8n-p2.pt
+    data: data/roboflow/data.yaml
+    imgsz: 640
+  - modality: rgb
+    weights: runs/detect/rgb/yolo11n.pt
+    data: data/roboflow/data.yaml
+    imgsz: 640
+  - modality: rgb
+    weights: runs/detect/rgb/yolo26n.pt
+    data: data/roboflow/data.yaml
+    imgsz: 640
+  - modality: rgb
+    weights: runs/detect/rgb/yolo26s.pt
+    data: data/roboflow/data.yaml
+    imgsz: 640
+
+  # LWIR models (4 architectures, trained at 960 px)
   - modality: lwir
-    weights: runs/detect/lwir/yolov8n_960px/weights/best.pt
+    weights: runs/detect/lwir/best_weights/yolov8n.pt
     data: data/lwir/data.yaml
+    imgsz: 960
+  - modality: lwir
+    weights: runs/detect/lwir/best_weights/yolov8n-p2.pt
+    data: data/lwir/data.yaml
+    imgsz: 960
+  - modality: lwir
+    weights: runs/detect/lwir/best_weights/yolo11n.pt
+    data: data/lwir/data.yaml
+    imgsz: 960
+  - modality: lwir
+    weights: runs/detect/lwir/best_weights/yolo26n.pt
+    data: data/lwir/data.yaml
+    imgsz: 960

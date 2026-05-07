@@ -32,7 +32,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
-from ultralytics import YOLO
+from ultralytics import RTDETR, YOLO
 
 from fusion import expand_boxes, filter_lwir, filter_rgb, fuse, load_homography, warp_boxes
 
@@ -44,6 +44,13 @@ _STREAM_ORDER = ("rgb", "lwir", "uv")
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def load_model(path: str):
+    """Load a YOLO or RT-DETR model based on the filename."""
+    if "rtdetr" in Path(path).stem.lower():
+        return RTDETR(path)
+    return YOLO(path)
 
 
 # ── frame source ──────────────────────────────────────────────────────────────
@@ -527,9 +534,9 @@ def fuse_selected_streams(
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
-    rgb_model  = YOLO(cfg.get("rgb_model")) if cfg.get("rgb_model") else None
-    lwir_model = YOLO(cfg.get("lwir_model")) if cfg.get("lwir_model") else None
-    uv_model   = YOLO(cfg.get("uv_model")) if cfg.get("uv_model") else None
+    rgb_model  = load_model(cfg["rgb_model"])  if cfg.get("rgb_model")  else None
+    lwir_model = load_model(cfg["lwir_model"]) if cfg.get("lwir_model") else None
+    uv_model   = load_model(cfg["uv_model"])   if cfg.get("uv_model")   else None
 
     rgb_src  = FrameSource(cfg["rgb_source"]) if cfg.get("rgb_source") else None
     lwir_src = FrameSource(cfg["lwir_source"]) if cfg.get("lwir_source") else None

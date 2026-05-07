@@ -1,21 +1,47 @@
 """
-Fusion evaluation: compare RGB-only, LWIR-only, WBF, and Bayesian against
-LWIR test-set ground-truth labels.
+Fusion evaluation on spatiotemporally synced 3-band videos.
 
-RGB frames are read from a synchronized video by mapping each LWIR frame's
-embedded index through the fps ratio:  rgb_idx = lwir_frame_num * (rgb_fps / lwir_fps)
+No ground truth required. Evaluates the fusion algorithm using
+confidence-based metrics computed across all frames of the synced streams.
+
+Variants evaluated:
+  rgb      — RGB detection only
+  lwir     — LWIR detection only (warped to RGB space)
+  uv       — UV detection only  (warped to RGB space)
+  wbf      — Weighted Boxes Fusion, all 3 bands
+  bayesian — Bayesian fusion, all 3 bands (chained)
+  spatial  — Center-distance spatial clustering, all 3 bands
+
+Metrics (no GT needed):
+  mean_conf          — mean confidence of all detections across all frames
+  mean_dets_per_frame — average number of detections per frame
+  detection_rate     — fraction of frames with at least one detection
+  conf_stability     — 1 - std(per-frame mean confidence); higher = more stable
+  multi_band_rate    — fraction of detections confirmed by 2+ bands (spatial only)
+  all_band_rate      — fraction of detections confirmed by all 3 bands (spatial only)
 """
 
 import argparse
 from pathlib import Path
 
 import cv2
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import yaml
 from ultralytics import YOLO
 
-from fusion import filter_lwir, filter_rgb, fuse
+from fusion import filter_lwir, filter_rgb, fuse, load_homography, warp_boxes
+
+_VARIANT_COLOR = {
+    "rgb":      "#4daafc",
+    "lwir":     "#f0883e",
+    "uv":       "#bc8cff",
+    "wbf":      "#3fb950",
+    "bayesian": "#f78166",
+    "spatial":  "#ffa657",
+}
 
 
 def load_config(path: str) -> dict:
@@ -23,194 +49,331 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-# ── ground truth ──────────────────────────────────────────────────────────────
+# ── chart helpers ─────────────────────────────────────────────────────────────
 
-def load_gt(label_path: Path) -> np.ndarray:
-    """YOLO label file → (N, 4) normalised [x1, y1, x2, y2]."""
-    if not label_path.exists():
-        return np.zeros((0, 4), dtype=np.float32)
-    rows = []
-    for line in label_path.read_text().splitlines():
-        parts = line.strip().split()
-        if len(parts) < 5:
-            continue
-        _, cx, cy, w, h = [float(v) for v in parts[:5]]
-        rows.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
-    return np.array(rows, dtype=np.float32) if rows else np.zeros((0, 4), dtype=np.float32)
+def _setup_dark_ax(ax):
+    ax.set_facecolor("#0d1117")
+    ax.tick_params(colors="#c9d1d9", labelsize=9)
+    ax.xaxis.label.set_color("#c9d1d9")
+    ax.yaxis.label.set_color("#c9d1d9")
+    ax.title.set_color("#58a6ff")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#30363d")
 
 
-# ── IoU + matching ────────────────────────────────────────────────────────────
-
-def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """(N, M) pairwise IoU for two sets of [x1, y1, x2, y2] boxes."""
-    if len(a) == 0 or len(b) == 0:
-        return np.zeros((len(a), len(b)), dtype=np.float32)
-    ix1 = np.maximum(a[:, None, 0], b[None, :, 0])
-    iy1 = np.maximum(a[:, None, 1], b[None, :, 1])
-    ix2 = np.minimum(a[:, None, 2], b[None, :, 2])
-    iy2 = np.minimum(a[:, None, 3], b[None, :, 3])
-    inter = np.maximum(ix2 - ix1, 0) * np.maximum(iy2 - iy1, 0)
-    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
-    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-    union = area_a[:, None] + area_b[None, :] - inter
-    return np.where(union > 0, inter / union, 0.0).astype(np.float32)
-
-
-def match_preds(
-    pred_boxes: np.ndarray,
-    pred_scores: np.ndarray,
-    gt_boxes: np.ndarray,
-    iou_thr: float,
-) -> list[tuple[float, bool]]:
-    """Return (score, is_tp) pairs for this image, sorted by descending score."""
-    if len(pred_boxes) == 0:
-        return []
-
-    order = np.argsort(-pred_scores)
-    pred_boxes  = pred_boxes[order]
-    pred_scores = pred_scores[order]
-
-    matched_gt: set = set()
-    ious = iou_matrix(pred_boxes, gt_boxes)   # (N_pred, N_gt)
-    records = []
-
-    for i in range(len(pred_boxes)):
-        is_tp = False
-        if ious.shape[1] > 0:
-            best_j = int(np.argmax(ious[i]))
-            if ious[i, best_j] >= iou_thr and best_j not in matched_gt:
-                is_tp = True
-                matched_gt.add(best_j)
-        records.append((float(pred_scores[i]), is_tp))
-
-    return records
+def _bar_chart(variants, values, title, ylabel, out_path, ylim=None, fmt=".3f"):
+    colors = [_VARIANT_COLOR.get(v, "#8b949e") for v in variants]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor("#0d1117")
+    _setup_dark_ax(ax)
+    bars = ax.bar(variants, values, color=colors, alpha=0.9, width=0.6)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
+                f"{val:{fmt}}", ha="center", va="bottom", fontsize=9, color="#c9d1d9")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    if ylim:
+        ax.set_ylim(*ylim)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
 
 
-# ── AP calculation ────────────────────────────────────────────────────────────
+def _grouped_bar_chart(variants, values_a, values_b, label_a, label_b, title, ylabel, out_path):
+    colors = [_VARIANT_COLOR.get(v, "#8b949e") for v in variants]
+    x = np.arange(len(variants))
+    w = 0.35
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor("#0d1117")
+    _setup_dark_ax(ax)
+    ax.bar(x - w / 2, values_a, w, label=label_a, color=colors, alpha=0.9)
+    ax.bar(x + w / 2, values_b, w, label=label_b, color=colors, alpha=0.55, hatch="//")
+    ax.set_xticks(x)
+    ax.set_xticklabels(variants)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_ylim(0, max(max(values_a), max(values_b)) * 1.15)
+    ax.legend(facecolor="#21262d", labelcolor="#c9d1d9", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
 
-def compute_ap(records: list[tuple[float, bool]], n_gt: int) -> float:
-    """11-point interpolated AP from (score, is_tp) records across all images."""
-    if n_gt == 0 or not records:
-        return 0.0
-    records = sorted(records, key=lambda x: -x[0])
-    tp = fp = 0
-    prec, rec = [], []
-    for _, is_tp in records:
-        if is_tp:
-            tp += 1
+
+def _agreement_bar(df_spatial: pd.DataFrame, out_path: Path) -> None:
+    categories = ["Single-band", "2-band", "3-band"]
+    multi_band = df_spatial["multi_band_rate"].iloc[0]
+    if np.isnan(multi_band):
+        return
+    single = 1.0 - multi_band
+    multi  = multi_band - df_spatial["all_band_rate"].iloc[0]
+    all3   = df_spatial["all_band_rate"].iloc[0]
+    values = [single, multi, all3]
+    colors = ["#484f58", "#3fb950", "#58a6ff"]
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    fig.patch.set_facecolor("#0d1117")
+    _setup_dark_ax(ax)
+    bars = ax.bar(categories, values, color=colors, alpha=0.9, width=0.5)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f"{val:.1%}", ha="center", va="bottom", fontsize=10, color="#c9d1d9")
+    ax.set_ylabel("Fraction of detections")
+    ax.set_title("Spatial Fusion — Band Agreement per Detection")
+    ax.set_ylim(0, 1.1)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def _save_table(df: pd.DataFrame, out_path: Path) -> None:
+    display_cols = ["variant", "mean_conf", "mean_dets_per_frame",
+                    "detection_rate", "conf_stability", "multi_band_rate", "all_band_rate"]
+    tdf = df[display_cols].copy()
+    tdf.columns = ["Variant", "Mean Conf", "Dets/Frame",
+                   "Det Rate", "Conf Stability", "≥2-Band Rate", "3-Band Rate"]
+
+    # Format floats
+    for col in tdf.columns[1:]:
+        tdf[col] = tdf[col].apply(lambda v: f"{v:.3f}" if isinstance(v, float) else v)
+
+    fig, ax = plt.subplots(figsize=(13, max(2.5, 0.5 * (len(tdf) + 1))))
+    fig.patch.set_facecolor("#0d1117")
+    ax.axis("off")
+
+    cell_colors = []
+    for _, row in df.iterrows():
+        base = _VARIANT_COLOR.get(row["variant"], "#8b949e")
+        cell_colors.append([base + "40"] * len(tdf.columns))
+
+    tbl = ax.table(
+        cellText=tdf.values,
+        colLabels=tdf.columns,
+        cellLoc="center",
+        loc="center",
+        cellColours=cell_colors,
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.6)
+
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#30363d")
+        if r == 0:
+            cell.set_facecolor("#21262d")
+            cell.set_text_props(color="#58a6ff", fontweight="bold")
         else:
-            fp += 1
-        prec.append(tp / (tp + fp))
-        rec.append(tp / n_gt)
-    ap = 0.0
-    for t in np.linspace(0, 1, 11):
-        vals = [p for p, r in zip(prec, rec) if r >= t]
-        ap += max(vals) if vals else 0.0
-    return ap / 11
+            cell.set_text_props(color="#c9d1d9")
+
+    ax.set_title("Fusion Confidence Evaluation — Synced 3-Band Streams",
+                 color="#58a6ff", fontsize=11, fontweight="bold", pad=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def main(cfg: dict):
+def main(cfg: dict) -> pd.DataFrame:
+    out_dir = Path(cfg.get("project", "results/fusion"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     rgb_model  = YOLO(cfg["rgb_model"])
     lwir_model = YOLO(cfg["lwir_model"])
+    uv_model   = YOLO(cfg["uv_model"]) if cfg.get("uv_model") else None
 
-    lwir_imgs = sorted(Path(cfg["lwir_images"]).glob("*.jpg"))
-    lbl_dir   = Path(cfg["lwir_labels"])
-
-    rgb_cap  = cv2.VideoCapture(cfg["rgb_video"])
-    rgb_fps  = rgb_cap.get(cv2.CAP_PROP_FPS) or 50.0
-    lwir_fps = float(cfg.get("lwir_fps", 30.0))
+    H_lwir = load_homography(cfg.get("lwir_homography"))
+    H_uv   = load_homography(cfg.get("uv_homography"))
 
     iou_thr  = float(cfg.get("iou_thr",  0.55))
     skip_thr = float(cfg.get("skip_thr", 0.01))
-    imgsz    = int(cfg.get("imgsz",      320))
+    imgsz    = int(cfg.get("imgsz",     960))
     device   = cfg.get("device", "cpu")
     max_frames = cfg.get("max_frames", None)
 
-    infer_kw = dict(imgsz=imgsz, device=device, verbose=False, conf=0.01)
+    infer_kw = dict(imgsz=imgsz, device=device, verbose=False, conf=skip_thr)
 
-    # Accumulators: {variant: (records_list, n_gt)}
-    acc: dict[str, tuple[list, int]] = {
-        k: ([], 0) for k in ("rgb", "lwir", "wbf", "bayesian")
-    }
+    rgb_cap  = cv2.VideoCapture(cfg["rgb_video"])
+    lwir_cap = cv2.VideoCapture(cfg["lwir_video"])
+    uv_cap   = cv2.VideoCapture(cfg["uv_video"]) if cfg.get("uv_video") else None
 
+    # Read canvas dimensions from first frame
+    ok_r, _rf = rgb_cap.read()
+    rgb_wh = (_rf.shape[1], _rf.shape[0]) if ok_r else (1440, 1080)
+    rgb_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    ok_l, _lf = lwir_cap.read()
+    lwir_wh = (_lf.shape[1], _lf.shape[0]) if ok_l else (1440, 1080)
+    lwir_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    uv_wh = None
+    if uv_cap is not None:
+        ok_u, _uf = uv_cap.read()
+        uv_wh = (_uf.shape[1], _uf.shape[0]) if ok_u else (1440, 1080)
+        uv_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    total = int(min(
+        rgb_cap.get(cv2.CAP_PROP_FRAME_COUNT),
+        lwir_cap.get(cv2.CAP_PROP_FRAME_COUNT),
+        uv_cap.get(cv2.CAP_PROP_FRAME_COUNT) if uv_cap else float("inf"),
+    ))
     if max_frames is not None:
-        lwir_imgs = lwir_imgs[:max_frames]
+        total = min(total, max_frames)
 
-    print(f"Evaluating {len(lwir_imgs)} frames ...")
+    variants = ["rgb", "lwir", "uv", "wbf", "bayesian", "spatial"]
 
-    for i, lwir_path in enumerate(lwir_imgs):
-        # Frame number is the trailing integer in the stem: senaryo3_frame_000042 → 42
-        try:
-            frame_num = int(lwir_path.stem.rsplit("_", 1)[-1])
-        except ValueError:
-            frame_num = i
+    # Per-frame accumulators
+    frame_confs: dict[str, list[float]]  = {v: [] for v in variants}
+    frame_counts: dict[str, list[int]]   = {v: [] for v in variants}
+    # Spatial-only: per-detection sensor counts
+    spatial_sensor_counts: list[int] = []
 
-        lwir_frame = cv2.imread(str(lwir_path))
-        if lwir_frame is None:
-            continue
+    print(f"Evaluating {total} frames across 3 synced bands ...")
 
-        # Seek RGB to temporally corresponding frame
-        rgb_idx = int(round(frame_num * rgb_fps / lwir_fps))
-        rgb_cap.set(cv2.CAP_PROP_POS_FRAMES, rgb_idx)
-        ok, rgb_frame = rgb_cap.read()
-        if not ok or rgb_frame is None:
-            rgb_frame = np.zeros_like(lwir_frame)   # blank fallback
+    for frame_i in range(total):
+        ok_r, rgb_frame  = rgb_cap.read()
+        ok_l, lwir_frame = lwir_cap.read()
+        ok_u, uv_frame   = (uv_cap.read() if uv_cap else (False, None))
 
-        gt = load_gt(lbl_dir / f"{lwir_path.stem}.txt")
+        if not ok_r and not ok_l:
+            break
 
         # Inference
-        rgb_res  = rgb_model(rgb_frame,   **infer_kw)[0]
-        lwir_res = lwir_model(lwir_frame, **infer_kw)[0]
+        rgb_res  = rgb_model(rgb_frame,   **infer_kw)[0] if ok_r else None
+        lwir_res = lwir_model(lwir_frame, **infer_kw)[0] if ok_l else None
+        uv_res   = (uv_model(uv_frame, **infer_kw)[0]
+                    if uv_model and ok_u and uv_frame is not None else None)
 
-        boxes_r,   scores_r   = filter_rgb(rgb_res)
-        boxes_l,   scores_l   = filter_lwir(lwir_res)
-        boxes_wbf, scores_wbf = fuse(boxes_r, scores_r, boxes_l, scores_l,
-                                     method="wbf", iou_thr=iou_thr, skip_thr=skip_thr)
-        boxes_bay, scores_bay = fuse(boxes_r, scores_r, boxes_l, scores_l,
-                                     method="bayesian", iou_thr=iou_thr)
+        _empty = (np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32))
+        boxes_r,     scores_r = filter_rgb(rgb_res)   if rgb_res  is not None else _empty
+        boxes_l_raw, scores_l = filter_lwir(lwir_res) if lwir_res is not None else _empty
+        boxes_u_raw, scores_u = filter_lwir(uv_res)   if uv_res   is not None else _empty
 
-        for name, (bx, sc) in [
-            ("rgb",      (boxes_r,   scores_r)),
-            ("lwir",     (boxes_l,   scores_l)),
-            ("wbf",      (boxes_wbf, scores_wbf)),
-            ("bayesian", (boxes_bay, scores_bay)),
-        ]:
-            recs = match_preds(bx, sc, gt, iou_thr)
-            records, n_gt = acc[name]
-            records.extend(recs)
-            acc[name] = (records, n_gt + len(gt))
+        # Warp LWIR and UV detections to RGB canvas space
+        boxes_l = warp_boxes(boxes_l_raw, H_lwir, lwir_wh, rgb_wh) if H_lwir is not None else boxes_l_raw
+        boxes_u = (warp_boxes(boxes_u_raw, H_uv, uv_wh, rgb_wh)
+                   if H_uv is not None and uv_wh is not None else boxes_u_raw)
 
-        if (i + 1) % 100 == 0:
-            print(f"  {i + 1}/{len(lwir_imgs)} frames", flush=True)
+        # All 6 variants in RGB space
+        boxes_wbf, scores_wbf = fuse(
+            boxes_r, scores_r, boxes_l, scores_l,
+            boxes3=boxes_u, scores3=scores_u,
+            method="wbf", iou_thr=iou_thr, skip_thr=skip_thr,
+        )
+        boxes_bay, scores_bay = fuse(
+            boxes_r, scores_r, boxes_l, scores_l,
+            boxes3=boxes_u, scores3=scores_u,
+            method="bayesian", iou_thr=iou_thr,
+        )
+        boxes_spa, scores_spa, details_spa = fuse(
+            boxes_r, scores_r, boxes_l, scores_l,
+            boxes3=boxes_u, scores3=scores_u,
+            method="spatial", image_wh=rgb_wh, skip_thr=skip_thr,
+            source_names=["rgb", "lwir", "uv"],
+            return_details=True,
+        )
+
+        frame_preds = {
+            "rgb":      scores_r,
+            "lwir":     scores_l,
+            "uv":       scores_u,
+            "wbf":      scores_wbf,
+            "bayesian": scores_bay,
+            "spatial":  scores_spa,
+        }
+
+        for v, scores in frame_preds.items():
+            frame_counts[v].append(len(scores))
+            frame_confs[v].append(float(scores.mean()) if len(scores) > 0 else float("nan"))
+
+        # Spatial: record how many bands confirmed each detection
+        if details_spa:
+            for d in details_spa:
+                spatial_sensor_counts.append(d["sensor_count"])
+
+        if (frame_i + 1) % 100 == 0:
+            print(f"  {frame_i + 1}/{total} frames", flush=True)
 
     rgb_cap.release()
+    lwir_cap.release()
+    if uv_cap is not None:
+        uv_cap.release()
 
+    # ── aggregate metrics ─────────────────────────────────────────────────────
     rows = []
-    for name, (records, n_gt) in acc.items():
-        ap = compute_ap(records, n_gt)
+    for v in variants:
+        counts = np.array(frame_counts[v])
+        confs  = np.array([c for c in frame_confs[v] if not np.isnan(c)])
+
+        mean_conf   = float(confs.mean())  if len(confs)  > 0 else 0.0
+        conf_std    = float(confs.std())   if len(confs)  > 1 else 0.0
+        mean_dets   = float(counts.mean()) if len(counts) > 0 else 0.0
+        det_rate    = float((counts > 0).mean()) if len(counts) > 0 else 0.0
+        stability   = round(1.0 - conf_std, 4)
+
+        if v == "spatial" and spatial_sensor_counts:
+            sc = np.array(spatial_sensor_counts)
+            multi_band = float((sc >= 2).mean())
+            all_band   = float((sc >= 3).mean())
+        else:
+            multi_band = float("nan")
+            all_band   = float("nan")
+
         rows.append({
-            "variant":    name,
-            "mAP@50":     round(ap, 4),
-            "n_gt_boxes": n_gt,
-            "n_preds":    len(records),
+            "variant":            v,
+            "mean_conf":          round(mean_conf, 4),
+            "mean_dets_per_frame": round(mean_dets, 2),
+            "detection_rate":     round(det_rate,  4),
+            "conf_stability":     stability,
+            "multi_band_rate":    round(multi_band, 4) if not np.isnan(multi_band) else float("nan"),
+            "all_band_rate":      round(all_band,   4) if not np.isnan(all_band)   else float("nan"),
         })
 
     df = pd.DataFrame(rows)
-    print("\n=== Fusion Evaluation (LWIR test set) ===")
+
+    print("\n=== Fusion Confidence Evaluation ===")
     try:
         print(df.to_markdown(index=False))
     except ImportError:
         print(df.to_string(index=False))
 
-    out = Path(cfg.get("project", "runs")) / "eval_fusion.csv"
-    df.to_csv(out, index=False)
-    print(f"\nSaved to {out}")
+    csv_path = out_dir / "eval_fusion.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nSaved to {csv_path}")
+
+    # ── charts ────────────────────────────────────────────────────────────────
+    vs = df["variant"].tolist()
+
+    _bar_chart(vs, df["mean_conf"].tolist(),
+               "Mean Detection Confidence per Variant", "Confidence (0–1)",
+               out_dir / "fusion_mean_conf.png", ylim=(0, 1.05))
+
+    _grouped_bar_chart(vs,
+               df["mean_dets_per_frame"].tolist(),
+               df["detection_rate"].tolist(),
+               "Dets / Frame", "Detection Rate",
+               "Detections per Frame vs Detection Rate",
+               "Value", out_dir / "fusion_dets.png")
+
+    _bar_chart(vs, df["conf_stability"].tolist(),
+               "Confidence Stability per Variant (1 − std)",
+               "Stability (higher = more consistent)",
+               out_dir / "fusion_stability.png", ylim=(0, 1.05))
+
+    spa_row = df[df["variant"] == "spatial"]
+    if not spa_row.empty and not np.isnan(spa_row["multi_band_rate"].iloc[0]):
+        _agreement_bar(spa_row, out_dir / "fusion_agreement.png")
+
+    _save_table(df, out_dir / "fusion_table.png")
+
+    print(f"Charts saved to {out_dir}/")
+    return df
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate fusion vs individual models.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate fusion variants on synced 3-band streams (confidence-based, no GT)."
+    )
     parser.add_argument("--config", default="configs/eval_fusion.yaml")
     args = parser.parse_args()
     main(load_config(args.config))
